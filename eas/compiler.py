@@ -25,6 +25,39 @@ def _buffer_dtype(a: np.ndarray) -> DType:
     raise TypeError(f"unsupported dtype: {a.dtype} (expected float32)")
 
 
+def _is_tensor(v: Any) -> bool:
+    return bool(getattr(v, "__eas_tensor__", False))
+
+
+def _is_torch_tensor(v: Any) -> bool:
+    try:
+        import torch  # type: ignore
+
+        return isinstance(v, torch.Tensor)
+    except Exception:
+        return False
+
+
+def _torch_buffer_dtype(v: Any) -> DType:
+    try:
+        import torch  # type: ignore
+
+        if v.dtype == torch.float32:
+            return DType.F32
+        raise TypeError(f"unsupported torch dtype: {v.dtype} (expected float32)")
+    except ImportError:
+        raise TypeError("torch tensor provided but torch is not importable")
+
+
+def _tensor_dtype(v: Any) -> DType:
+    dt = getattr(v, "dtype", None)
+    if dt is None:
+        raise TypeError("tensor argument is missing dtype")
+    if np.dtype(dt) == np.float32:
+        return DType.F32
+    raise TypeError(f"unsupported tensor dtype: {dt} (expected float32)")
+
+
 @dataclass(slots=True)
 class _IRBuilder:
     name: str
@@ -136,8 +169,14 @@ def trace_to_ir(
 
     trace_kwargs: dict[str, Any] = {}
     for name, value in runtime_args.items():
-        if isinstance(value, np.ndarray):
-            arg = Arg(name=name, dtype=_buffer_dtype(value), kind="buffer")
+        if isinstance(value, np.ndarray) or _is_tensor(value) or _is_torch_tensor(value):
+            if isinstance(value, np.ndarray):
+                dtype = _buffer_dtype(value)
+            elif _is_torch_tensor(value):
+                dtype = _torch_buffer_dtype(value)
+            else:
+                dtype = _tensor_dtype(value)
+            arg = Arg(name=name, dtype=dtype, kind="buffer")
             builder.args.append(arg)
             v = builder._new(DType.F32)
             builder.insts.append(Inst("arg", v.ref, (name, arg.kind, arg.dtype)))
@@ -204,4 +243,3 @@ def compile(
     return CompiledKernel(
         ir=ir, msl=msl_src, threadgroup_size=threadgroup_size, writes=writes
     )
-

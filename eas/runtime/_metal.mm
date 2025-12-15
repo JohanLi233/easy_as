@@ -5,11 +5,13 @@
 #import <Metal/Metal.h>
 
 #include <CoreFoundation/CoreFoundation.h>
+#include <mutex>
 
 namespace {
 
 static const char* kPipelineCapsuleName = "eas._metal.pipeline";
 static const char* kPendingCapsuleName = "eas._metal.pending";
+static const char* kBufferCapsuleName = "eas._metal.buffer";
 
 struct Pipeline {
   void* device;
@@ -17,12 +19,34 @@ struct Pipeline {
   void* pso;
 };
 
+struct Buffer {
+  void* buf;
+  Py_ssize_t nbytes;
+  int storage;  // 0=shared, 1=private
+};
+
 struct Pending {
   void* cb;
   void* buffers;
   Py_buffer* views;
+  PyObject** keepalive;
   Py_ssize_t argc;
 };
+
+static void buffer_capsule_destructor(PyObject* capsule) {
+  void* ptr = PyCapsule_GetPointer(capsule, kBufferCapsuleName);
+  if (!ptr) {
+    return;
+  }
+  auto* b = static_cast<Buffer*>(ptr);
+  @autoreleasepool {
+    if (b->buf) {
+      CFRelease(b->buf);
+      b->buf = nullptr;
+    }
+  }
+  delete b;
+}
 
 static void pipeline_capsule_destructor(PyObject* capsule) {
   void* ptr = PyCapsule_GetPointer(capsule, kPipelineCapsuleName);
@@ -70,18 +94,49 @@ static void pending_capsule_destructor(PyObject* capsule) {
     free(p->views);
     p->views = nullptr;
   }
+  if (p->keepalive) {
+    for (Py_ssize_t i = 0; i < p->argc; i++) {
+      Py_XDECREF(p->keepalive[i]);
+    }
+    free(p->keepalive);
+    p->keepalive = nullptr;
+  }
   p->argc = 0;
   delete p;
 }
 
+static id<MTLDevice> get_device() {
+  static id<MTLDevice> device = nil;
+  static std::once_flag once;
+  std::call_once(once, []() {
+    @autoreleasepool {
+      device = MTLCreateSystemDefaultDevice();
+      if (!device) {
+        NSArray<id<MTLDevice>>* devices = MTLCopyAllDevices();
+        device = devices.firstObject;
+      }
+    }
+  });
+  return device;
+}
+
+static id<MTLCommandQueue> get_queue() {
+  static id<MTLCommandQueue> queue = nil;
+  static std::once_flag once;
+  std::call_once(once, []() {
+    @autoreleasepool {
+      id<MTLDevice> device = get_device();
+      if (device) {
+        queue = [device newCommandQueue];
+      }
+    }
+  });
+  return queue;
+}
+
 static PyObject* is_available(PyObject* /*self*/, PyObject* /*args*/) {
   @autoreleasepool {
-    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
-    if (device) {
-      Py_RETURN_TRUE;
-    }
-    NSArray<id<MTLDevice>>* devices = MTLCopyAllDevices();
-    if (devices && devices.count > 0) {
+    if (get_device()) {
       Py_RETURN_TRUE;
     }
     Py_RETURN_FALSE;
@@ -96,16 +151,12 @@ static PyObject* compile(PyObject* /*self*/, PyObject* args) {
   }
 
   @autoreleasepool {
-    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
-    if (!device) {
-      NSArray<id<MTLDevice>>* devices = MTLCopyAllDevices();
-      device = devices.firstObject;
-    }
+    id<MTLDevice> device = get_device();
     if (!device) {
       PyErr_SetString(PyExc_RuntimeError, "no Metal devices available");
       return nullptr;
     }
-    id<MTLCommandQueue> queue = [device newCommandQueue];
+    id<MTLCommandQueue> queue = get_queue();
     if (!queue) {
       PyErr_SetString(PyExc_RuntimeError, "failed to create MTLCommandQueue");
       return nullptr;
@@ -144,6 +195,197 @@ static PyObject* compile(PyObject* /*self*/, PyObject* args) {
 
     return PyCapsule_New(pipeline, kPipelineCapsuleName, pipeline_capsule_destructor);
   }
+}
+
+static PyObject* alloc_buffer(PyObject* /*self*/, PyObject* args) {
+  long long nbytes_ll = 0;
+  const char* storage_c = nullptr;
+  if (!PyArg_ParseTuple(args, "Ls", &nbytes_ll, &storage_c)) {
+    return nullptr;
+  }
+  if (nbytes_ll <= 0) {
+    PyErr_SetString(PyExc_ValueError, "nbytes must be > 0");
+    return nullptr;
+  }
+  @autoreleasepool {
+    id<MTLDevice> device = get_device();
+    if (!device) {
+      PyErr_SetString(PyExc_RuntimeError, "no Metal devices available");
+      return nullptr;
+    }
+    NSString* storage = [NSString stringWithUTF8String:storage_c ? storage_c : ""];
+    MTLResourceOptions opts = 0;
+    int storage_tag = 0;
+    if ([storage isEqualToString:@"private"]) {
+      opts = MTLResourceStorageModePrivate;
+      storage_tag = 1;
+    } else if ([storage isEqualToString:@"shared"]) {
+      opts = MTLResourceStorageModeShared;
+      storage_tag = 0;
+    } else {
+      PyErr_Format(PyExc_ValueError, "unsupported storage: %s (expected 'private'|'shared')", storage_c);
+      return nullptr;
+    }
+    id<MTLBuffer> buf = [device newBufferWithLength:(NSUInteger)nbytes_ll options:opts];
+    if (!buf) {
+      PyErr_SetString(PyExc_RuntimeError, "failed to allocate MTLBuffer");
+      return nullptr;
+    }
+    auto* b = new Buffer();
+    b->buf = (__bridge_retained void*)buf;
+    b->nbytes = (Py_ssize_t)nbytes_ll;
+    b->storage = storage_tag;
+    return PyCapsule_New(b, kBufferCapsuleName, buffer_capsule_destructor);
+  }
+}
+
+static bool copy_from_host_impl(Buffer* b, Py_buffer* src_view) {
+  if (src_view->len <= 0 || src_view->buf == nullptr) {
+    PyErr_SetString(PyExc_ValueError, "source buffer cannot be empty");
+    return false;
+  }
+  if (src_view->len > b->nbytes) {
+    PyErr_SetString(PyExc_ValueError, "source is larger than destination buffer");
+    return false;
+  }
+  @autoreleasepool {
+    id<MTLBuffer> dst = (__bridge id<MTLBuffer>)b->buf;
+    if (b->storage == 0) {
+      memcpy(dst.contents, src_view->buf, (size_t)src_view->len);
+      return true;
+    }
+    id<MTLDevice> device = get_device();
+    id<MTLCommandQueue> queue = get_queue();
+    if (!device || !queue) {
+      PyErr_SetString(PyExc_RuntimeError, "Metal device/queue unavailable");
+      return false;
+    }
+    id<MTLBuffer> staging = [device newBufferWithBytes:src_view->buf
+                                                length:(NSUInteger)src_view->len
+                                               options:MTLResourceStorageModeShared];
+    if (!staging) {
+      PyErr_SetString(PyExc_RuntimeError, "failed to allocate staging buffer");
+      return false;
+    }
+    id<MTLCommandBuffer> cb = [queue commandBuffer];
+    if (!cb) {
+      PyErr_SetString(PyExc_RuntimeError, "failed to create MTLCommandBuffer");
+      return false;
+    }
+    id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+    if (!blit) {
+      PyErr_SetString(PyExc_RuntimeError, "failed to create MTLBlitCommandEncoder");
+      return false;
+    }
+    [blit copyFromBuffer:staging sourceOffset:0 toBuffer:dst destinationOffset:0 size:(NSUInteger)src_view->len];
+    [blit endEncoding];
+    [cb commit];
+    [cb waitUntilCompleted];
+    if (cb.status == MTLCommandBufferStatusError) {
+      NSError* err = cb.error;
+      const char* msg = err ? [[err localizedDescription] UTF8String] : "unknown error";
+      PyErr_Format(PyExc_RuntimeError, "Metal blit failed: %s", msg);
+      return false;
+    }
+    return true;
+  }
+}
+
+static bool copy_to_host_impl(Buffer* b, Py_buffer* dst_view) {
+  if (dst_view->len <= 0 || dst_view->buf == nullptr) {
+    PyErr_SetString(PyExc_ValueError, "destination buffer cannot be empty");
+    return false;
+  }
+  if (dst_view->len < b->nbytes) {
+    PyErr_SetString(PyExc_ValueError, "destination is smaller than source buffer");
+    return false;
+  }
+  @autoreleasepool {
+    id<MTLBuffer> src = (__bridge id<MTLBuffer>)b->buf;
+    if (b->storage == 0) {
+      memcpy(dst_view->buf, src.contents, (size_t)b->nbytes);
+      return true;
+    }
+    id<MTLDevice> device = get_device();
+    id<MTLCommandQueue> queue = get_queue();
+    if (!device || !queue) {
+      PyErr_SetString(PyExc_RuntimeError, "Metal device/queue unavailable");
+      return false;
+    }
+    id<MTLBuffer> staging = [device newBufferWithLength:(NSUInteger)b->nbytes options:MTLResourceStorageModeShared];
+    if (!staging) {
+      PyErr_SetString(PyExc_RuntimeError, "failed to allocate staging buffer");
+      return false;
+    }
+    id<MTLCommandBuffer> cb = [queue commandBuffer];
+    if (!cb) {
+      PyErr_SetString(PyExc_RuntimeError, "failed to create MTLCommandBuffer");
+      return false;
+    }
+    id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+    if (!blit) {
+      PyErr_SetString(PyExc_RuntimeError, "failed to create MTLBlitCommandEncoder");
+      return false;
+    }
+    [blit copyFromBuffer:src sourceOffset:0 toBuffer:staging destinationOffset:0 size:(NSUInteger)b->nbytes];
+    [blit endEncoding];
+    [cb commit];
+    [cb waitUntilCompleted];
+    if (cb.status == MTLCommandBufferStatusError) {
+      NSError* err = cb.error;
+      const char* msg = err ? [[err localizedDescription] UTF8String] : "unknown error";
+      PyErr_Format(PyExc_RuntimeError, "Metal blit failed: %s", msg);
+      return false;
+    }
+    memcpy(dst_view->buf, staging.contents, (size_t)b->nbytes);
+    return true;
+  }
+}
+
+static PyObject* copy_from_host(PyObject* /*self*/, PyObject* args) {
+  PyObject* capsule = nullptr;
+  PyObject* src_obj = nullptr;
+  if (!PyArg_ParseTuple(args, "OO", &capsule, &src_obj)) {
+    return nullptr;
+  }
+  void* ptr = PyCapsule_GetPointer(capsule, kBufferCapsuleName);
+  if (!ptr) {
+    return nullptr;
+  }
+  auto* b = static_cast<Buffer*>(ptr);
+  Py_buffer view;
+  if (PyObject_GetBuffer(src_obj, &view, PyBUF_CONTIG_RO) != 0) {
+    return nullptr;
+  }
+  bool ok = copy_from_host_impl(b, &view);
+  PyBuffer_Release(&view);
+  if (!ok) {
+    return nullptr;
+  }
+  Py_RETURN_NONE;
+}
+
+static PyObject* copy_to_host(PyObject* /*self*/, PyObject* args) {
+  PyObject* capsule = nullptr;
+  PyObject* dst_obj = nullptr;
+  if (!PyArg_ParseTuple(args, "OO", &capsule, &dst_obj)) {
+    return nullptr;
+  }
+  void* ptr = PyCapsule_GetPointer(capsule, kBufferCapsuleName);
+  if (!ptr) {
+    return nullptr;
+  }
+  auto* b = static_cast<Buffer*>(ptr);
+  Py_buffer view;
+  if (PyObject_GetBuffer(dst_obj, &view, PyBUF_CONTIG | PyBUF_WRITABLE) != 0) {
+    return nullptr;
+  }
+  bool ok = copy_to_host_impl(b, &view);
+  PyBuffer_Release(&view);
+  if (!ok) {
+    return nullptr;
+  }
+  Py_RETURN_NONE;
 }
 
 static PyObject* launch_async(PyObject* /*self*/, PyObject* args) {
@@ -219,7 +461,15 @@ static PyObject* launch_async(PyObject* /*self*/, PyObject* args) {
 
     NSMutableArray<id<MTLBuffer>>* buffers = [NSMutableArray arrayWithCapacity:(NSUInteger)argc];
     Py_buffer* views = static_cast<Py_buffer*>(calloc((size_t)argc, sizeof(Py_buffer)));
+    PyObject** keepalive = static_cast<PyObject**>(calloc((size_t)argc, sizeof(PyObject*)));
     if (!views) {
+      Py_DECREF(writable);
+      Py_DECREF(argv);
+      PyErr_NoMemory();
+      return nullptr;
+    }
+    if (!keepalive) {
+      free(views);
       Py_DECREF(writable);
       Py_DECREF(argv);
       PyErr_NoMemory();
@@ -264,6 +514,28 @@ static PyObject* launch_async(PyObject* /*self*/, PyObject* args) {
         continue;
       }
 
+      // Reusable device buffers are passed as capsules.
+      if (PyCapsule_CheckExact(obj)) {
+        void* bptr = PyCapsule_GetPointer(obj, kBufferCapsuleName);
+        if (bptr) {
+          auto* b = static_cast<Buffer*>(bptr);
+          id<MTLBuffer> buf = (__bridge id<MTLBuffer>)b->buf;
+          if (!buf) {
+            PyErr_SetString(PyExc_RuntimeError, "invalid Metal buffer capsule");
+            ok = false;
+            break;
+          }
+          [enc setBuffer:buf offset:0 atIndex:(NSUInteger)i];
+          Py_INCREF(obj);
+          keepalive[i] = obj;
+          continue;
+        }
+        if (PyErr_Occurred()) {
+          ok = false;
+          break;
+        }
+      }
+
       int flags = want_write ? PyBUF_CONTIG : PyBUF_CONTIG_RO;
       if (PyObject_GetBuffer(obj, &views[i], flags) != 0) {
         ok = false;
@@ -293,7 +565,9 @@ static PyObject* launch_async(PyObject* /*self*/, PyObject* args) {
         if (views[i].obj) {
           PyBuffer_Release(&views[i]);
         }
+        Py_XDECREF(keepalive[i]);
       }
+      free(keepalive);
       free(views);
       Py_DECREF(writable);
       Py_DECREF(argv);
@@ -311,6 +585,7 @@ static PyObject* launch_async(PyObject* /*self*/, PyObject* args) {
     pending->cb = (__bridge_retained void*)cb;
     pending->buffers = (__bridge_retained void*)buffers;
     pending->views = views;
+    pending->keepalive = keepalive;
     pending->argc = argc;
 
     Py_DECREF(writable);
@@ -354,6 +629,13 @@ static PyObject* synchronize(PyObject* /*self*/, PyObject* args) {
       }
       free(p->views);
       p->views = nullptr;
+    }
+    if (p->keepalive) {
+      for (Py_ssize_t i = 0; i < p->argc; i++) {
+        Py_XDECREF(p->keepalive[i]);
+      }
+      free(p->keepalive);
+      p->keepalive = nullptr;
     }
     p->argc = 0;
 
@@ -484,6 +766,26 @@ static PyObject* launch(PyObject* /*self*/, PyObject* args) {
         continue;
       }
 
+      // Reusable device buffers are passed as capsules.
+      if (PyCapsule_CheckExact(obj)) {
+        void* bptr = PyCapsule_GetPointer(obj, kBufferCapsuleName);
+        if (bptr) {
+          auto* b = static_cast<Buffer*>(bptr);
+          id<MTLBuffer> buf = (__bridge id<MTLBuffer>)b->buf;
+          if (!buf) {
+            PyErr_SetString(PyExc_RuntimeError, "invalid Metal buffer capsule");
+            ok = false;
+            break;
+          }
+          [enc setBuffer:buf offset:0 atIndex:(NSUInteger)i];
+          continue;
+        }
+        if (PyErr_Occurred()) {
+          ok = false;
+          break;
+        }
+      }
+
       int flags = want_write ? PyBUF_CONTIG : PyBUF_CONTIG_RO;
       if (PyObject_GetBuffer(obj, &views[i], flags) != 0) {
         ok = false;
@@ -556,6 +858,9 @@ static PyObject* launch(PyObject* /*self*/, PyObject* args) {
 static PyMethodDef Methods[] = {
     {"is_available", is_available, METH_NOARGS, nullptr},
     {"compile", compile, METH_VARARGS, nullptr},
+    {"alloc_buffer", alloc_buffer, METH_VARARGS, nullptr},
+    {"copy_from_host", copy_from_host, METH_VARARGS, nullptr},
+    {"copy_to_host", copy_to_host, METH_VARARGS, nullptr},
     {"launch", launch, METH_VARARGS, nullptr},
     {"launch_async", launch_async, METH_VARARGS, nullptr},
     {"synchronize", synchronize, METH_VARARGS, nullptr},

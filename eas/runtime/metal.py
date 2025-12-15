@@ -11,6 +11,9 @@ import numpy as np
 from ..ir import DType, IRModule
 from .metal_ext import load_metal_ext
 
+def _is_tensor(v: Any) -> bool:
+    return bool(getattr(v, "__eas_tensor__", False))
+
 def _pack_scalar(dtype: DType, value: Any) -> bytes:
     if dtype == DType.U32:
         return struct.pack("<I", int(value))
@@ -99,9 +102,25 @@ class MetalRuntime:
         for arg in ir.args:
             v = runtime_args[arg.name]
             if arg.kind == "buffer":
+                try:
+                    import torch  # type: ignore
+
+                    if isinstance(v, torch.Tensor):
+                        raise TypeError(
+                            f"MetalRuntime expects eas.Tensor(device='metal') for {arg.name!r}; "
+                            "convert with eas.tensor(torch_tensor, device='metal')"
+                        )
+                except Exception:
+                    pass
+                if _is_tensor(v):
+                    if getattr(v, "device", None) == "metal":
+                        argv.append(v._metal_buffer())  # type: ignore[attr-defined]
+                        writable.append(arg.name in writes)
+                        continue
+                    v = v.numpy()  # type: ignore[assignment]
                 if not isinstance(v, np.ndarray):
                     raise TypeError(
-                        f"expected numpy.ndarray for {arg.name!r}, got {type(v)!r}"
+                        f"expected numpy.ndarray or eas.Tensor for {arg.name!r}, got {type(v)!r}"
                     )
                 if v.dtype != np.float32:
                     raise TypeError(f"{arg.name!r} must be float32, got {v.dtype}")

@@ -1,7 +1,7 @@
 [project]
 name = "easy-as"
 version = "0.0.1"
-description = "Python-first DSL for writing and running Metal kernels (MVP)."
+description = "Python-first kernel DSL for writing and running Metal kernels."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -18,4 +18,3 @@ dev = [
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
-

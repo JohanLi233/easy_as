@@ -48,7 +48,25 @@ class CpuRuntime:
         # Prepare runtime binding for args (name -> value)
         arg_values: dict[str, Any] = {}
         for arg in ir.args:
-            arg_values[arg.name] = runtime_args[arg.name]
+            v = runtime_args[arg.name]
+            if bool(getattr(v, "__eas_tensor__", False)):
+                if getattr(v, "device", None) != "cpu":
+                    raise TypeError("CpuRuntime only supports cpu tensors")
+                v = v.numpy()
+            else:
+                try:
+                    import torch  # type: ignore
+
+                    if isinstance(v, torch.Tensor):
+                        t = v.detach() if getattr(v, "requires_grad", False) else v
+                        if t.device.type != "cpu":
+                            raise TypeError(
+                                "CpuRuntime only supports CPU torch tensors; call .cpu() first"
+                            )
+                        v = t.contiguous().numpy()
+                except Exception:
+                    pass
+            arg_values[arg.name] = v
 
         for pid in range(grid):
             for tid in range(threadgroup_size):

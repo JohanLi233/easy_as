@@ -54,8 +54,15 @@ def main(argv: list[str] | None = None) -> None:
     c = np.zeros_like(a)
 
     # correctness (includes first-time compile)
-    add_kernel(a, b, c, n, BLOCK=block)
-    np.testing.assert_allclose(c, a + b)
+    if runtime_name == "MetalRuntime":
+        a_e = eas.tensor(a, device="metal")
+        b_e = eas.tensor(b, device="metal")
+        c_e = eas.empty_like(a_e)
+        add_kernel(a_e, b_e, c_e, n, BLOCK=block)
+        np.testing.assert_allclose(c_e.numpy(), a + b)
+    else:
+        add_kernel(a, b, c, n, BLOCK=block)
+        np.testing.assert_allclose(c, a + b)
     print("OK (correctness)")
 
     # test with torch tensors if available
@@ -70,8 +77,15 @@ def main(argv: list[str] | None = None) -> None:
         b_np = b_torch.cpu().numpy()
         c_np = np.zeros_like(a_np)
 
-        add_kernel(a_np, b_np, c_np, n, BLOCK=block)
-        np.testing.assert_allclose(c_np, a_np + b_np)
+        if runtime_name == "MetalRuntime":
+            a_e = eas.tensor(a_np, device="metal")
+            b_e = eas.tensor(b_np, device="metal")
+            c_e = eas.empty_like(a_e)
+            add_kernel(a_e, b_e, c_e, n, BLOCK=block)
+            np.testing.assert_allclose(c_e.numpy(), a_np + b_np)
+        else:
+            add_kernel(a_np, b_np, c_np, n, BLOCK=block)
+            np.testing.assert_allclose(c_np, a_np + b_np)
         torch.add(a_torch, b_torch, out=c_torch)
         # Move result to CPU for comparison
         np.testing.assert_allclose(c_torch.cpu().numpy(), a_np + b_np)
@@ -82,7 +96,10 @@ def main(argv: list[str] | None = None) -> None:
         runtime.synchronize()
     t0 = time.perf_counter()
     for _ in range(iters):
-        add_kernel(a, b, c, n, BLOCK=block, _sync=False)
+        if runtime_name == "MetalRuntime":
+            add_kernel(a_e, b_e, c_e, n, BLOCK=block, _sync=False)
+        else:
+            add_kernel(a, b, c, n, BLOCK=block, _sync=False)
     if hasattr(runtime, "synchronize"):
         runtime.synchronize()
     t1 = time.perf_counter()
