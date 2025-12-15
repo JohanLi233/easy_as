@@ -47,13 +47,13 @@ out = c.numpy()
 运行示例：
 
 ```bash
-python3 -m examples.add
+uv run python examples/add.py
 ```
 
 运行测试：
 
 ```bash
-python3 -m unittest discover -s tests -p "test*.py" -v
+uv run pytest tests/
 ```
 
 ## Metal 后端（GPU）
@@ -61,13 +61,13 @@ python3 -m unittest discover -s tests -p "test*.py" -v
 构建 `eas._metal` 扩展（ObjC++）：
 
 ```bash
-python3 tools/build_metal_ext.py
+uv run python tools/build_metal_ext.py
 ```
 
 使用 Metal 运行：
 
 ```bash
-EAS_BACKEND=metal python3 -m examples.add
+EAS_BACKEND=metal uv run python examples/add.py
 ```
 
 ## Torch 互操作
@@ -108,8 +108,29 @@ z = eas.to_dlpack(y)               # DLPack 胶囊（CPU；torch 风格）
 
 ## 配置
 
-- `EAS_BACKEND=auto|cpu|metal`
-- `EAS_MAX_IN_FLIGHT`：最大异步启动数量（在使用 `_sync=False` 调用内核时使用）。
+### 环境变量
+
+- `EAS_BACKEND=auto|cpu|metal`：选择后端
+- `EAS_MAX_IN_FLIGHT`：最大异步启动数量（在使用 `_sync=False` 调用内核时使用）
+
+### 使用 uv
+
+项目使用 [uv](https://github.com/astral-sh/uv) 进行依赖管理和开发：
+
+```bash
+# 安装依赖（包含开发依赖）
+uv sync --dev
+
+# 运行示例
+uv run python examples/add.py
+
+# 运行测试
+uv run pytest tests/
+
+# 激活虚拟环境（在当前shell中）
+source .venv/bin/activate
+python examples/add.py
+```
 
 ## 文档
 
