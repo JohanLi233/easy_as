@@ -159,7 +159,9 @@ def ir_to_msl(ir: IRModule) -> tuple[str, int]:
 
             allowed_users = candidate_inst_idxs | {store_idx}
             moved_value_ids = {
-                ir.insts[i].out.id for i in candidate_inst_idxs if ir.insts[i].out is not None
+                ir.insts[i].out.id
+                for i in candidate_inst_idxs
+                if ir.insts[i].out is not None
             }
             for value_id in moved_value_ids:
                 for user_idx in uses.get(value_id, set()):
@@ -227,7 +229,9 @@ def ir_to_msl(ir: IRModule) -> tuple[str, int]:
     # emit body
     moved_inst_idxs = {idx for idxs in lifted_by_store.values() for idx in idxs}
 
-    def _emit_inst(inst: Any, *, indent: str, in_guard_for_mask: ValueRef | None) -> None:
+    def _emit_inst(
+        inst: Any, *, indent: str, in_guard_for_mask: ValueRef | None
+    ) -> None:
         if inst.op in {"arg"}:
             return
         if inst.op == "const":
@@ -317,7 +321,11 @@ def ir_to_msl(ir: IRModule) -> tuple[str, int]:
         raise ValueError(f"unsupported op: {inst.op}")
 
     for idx, inst in enumerate(ir.insts):
-        if inst.out is not None and use_counts.get(inst.out.id, 0) == 0 and inst.op != "store":
+        if (
+            inst.out is not None
+            and use_counts.get(inst.out.id, 0) == 0
+            and inst.op != "store"
+        ):
             # Skip unused SSA defs (notably arange kept for threadgroup_size).
             continue
         if idx in moved_inst_idxs:

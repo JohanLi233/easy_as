@@ -30,6 +30,21 @@ class Kernel:
             raise TypeError(f"_sync must be bool, got {type(sync)!r}")
         return {"sync": sync}
 
+    def _compile_from_split(
+        self, meta: dict[str, Any], runtime_args: dict[str, Any]
+    ) -> CompiledKernel:
+        cache_key = (
+            tuple(sorted(meta.items())),
+            runtime_arg_signature(runtime_args),
+        )
+        cached = self._cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        ck = _compile(self.fn, runtime_args, meta)
+        self._cache[cache_key] = ck
+        return ck
+
     def _bind_and_split(
         self, /, *args: Any, **kwargs: Any
     ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -45,23 +60,12 @@ class Kernel:
     def compile(self, /, *args: Any, **kwargs: Any) -> CompiledKernel:
         _ = self._pop_runtime_options(kwargs)
         meta, runtime_args = self._bind_and_split(*args, **kwargs)
-
-        cache_key = (
-            tuple(sorted(meta.items())),
-            runtime_arg_signature(runtime_args),
-        )
-        cached = self._cache.get(cache_key)
-        if cached is not None:
-            return cached
-
-        ck = _compile(self.fn, runtime_args, meta)
-        self._cache[cache_key] = ck
-        return ck
+        return self._compile_from_split(meta, runtime_args)
 
     def __call__(self, /, *args: Any, **kwargs: Any) -> None:
         runtime_opts = self._pop_runtime_options(kwargs)
-        ck = self.compile(*args, **kwargs)
         meta, runtime_args = self._bind_and_split(*args, **kwargs)
+        ck = self._compile_from_split(meta, runtime_args)
         get_runtime().run(ck, runtime_args, meta, **runtime_opts)
 
     def to_msl(self, /, *args: Any, **kwargs: Any) -> str:

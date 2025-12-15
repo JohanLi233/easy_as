@@ -10,6 +10,23 @@ from . import mk
 from .analysis import infer_writes
 from .ir import Arg, ArgKind, DType, IRModule, Inst, ValueRef, validate_ir
 
+_TORCH: Any | None = None
+_TORCH_CHECKED = False
+
+
+def _get_torch() -> Any | None:
+    global _TORCH, _TORCH_CHECKED
+    if _TORCH_CHECKED:
+        return _TORCH
+    _TORCH_CHECKED = True
+    try:
+        import torch  # type: ignore
+
+        _TORCH = torch
+    except Exception:
+        _TORCH = None
+    return _TORCH
+
 
 @dataclass(frozen=True, slots=True)
 class RuntimeArgSig:
@@ -18,7 +35,9 @@ class RuntimeArgSig:
     device: str | None = None
 
 
-def runtime_arg_signature(runtime_args: Mapping[str, Any]) -> tuple[tuple[str, Any], ...]:
+def runtime_arg_signature(
+    runtime_args: Mapping[str, Any],
+) -> tuple[tuple[str, Any], ...]:
     """
     Return a stable signature for runtime args for kernel caching.
 
@@ -53,23 +72,22 @@ def _is_tensor(v: Any) -> bool:
 
 
 def _is_torch_tensor(v: Any) -> bool:
+    torch = _get_torch()
+    if torch is None:
+        return False
     try:
-        import torch  # type: ignore
-
         return isinstance(v, torch.Tensor)
     except Exception:
         return False
 
 
 def _torch_buffer_dtype(v: Any) -> DType:
-    try:
-        import torch  # type: ignore
-
-        if v.dtype == torch.float32:
-            return DType.F32
-        raise TypeError(f"unsupported torch dtype: {v.dtype} (expected float32)")
-    except ImportError:
+    torch = _get_torch()
+    if torch is None:
         raise TypeError("torch tensor provided but torch is not importable")
+    if v.dtype == torch.float32:
+        return DType.F32
+    raise TypeError(f"unsupported torch dtype: {v.dtype} (expected float32)")
 
 
 def _tensor_dtype(v: Any) -> DType:

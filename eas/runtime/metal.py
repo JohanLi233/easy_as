@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import struct
 import os
+import weakref
 from collections import deque
 from dataclasses import dataclass
 from typing import Any, Mapping
@@ -34,6 +35,9 @@ class MetalRuntime:
     _available: bool | None = None
     _pending: deque[Any] | None = None
     _max_in_flight: int | None = None
+    _torch_mod: Any | None = None
+    _torch_checked: bool = False
+    _dlpack_buffer_cache: dict[int, tuple[weakref.ref[Any], Any]] | None = None
 
     def _get_max_in_flight(self) -> int:
         v = self._max_in_flight
@@ -70,6 +74,41 @@ class MetalRuntime:
             self._metal = load_metal_ext(require=True)
         return self._metal
 
+    def _get_torch(self) -> Any | None:
+        if self._torch_checked:
+            return self._torch_mod
+        self._torch_checked = True
+        try:
+            import torch  # type: ignore
+
+            self._torch_mod = torch
+        except ImportError:
+            self._torch_mod = None
+        return self._torch_mod
+
+    def _torch_mps_tensor_to_metal_buffer(self, t: Any) -> Any:
+        cache = self._dlpack_buffer_cache
+        if cache is None:
+            cache = {}
+            self._dlpack_buffer_cache = cache
+
+        key = id(t)
+        cached = cache.get(key)
+        if cached is not None:
+            ref, buf = cached
+            if ref() is t:
+                return buf
+            cache.pop(key, None)
+
+        cap = t.__dlpack__()
+        buf, _shape = self._mod().dlpack_import(cap)
+        try:
+            weakref.finalize(t, cache.pop, key, None)
+            cache[key] = (weakref.ref(t), buf)
+        except TypeError:
+            pass
+        return buf
+
     def _get_pipeline(self, ck: Any) -> Any:
         if self._pipeline_cache is None:
             self._pipeline_cache = {}
@@ -99,63 +138,34 @@ class MetalRuntime:
 
         argv: list[object] = []
         writable: list[bool] = []
-        torch_mps_sync_needed = False
-        torch_mod: Any | None = None
-        if os.environ.get("EAS_TORCH_MPS_SYNC", "1").strip().lower() not in (
-            "0",
-            "false",
-            "no",
-            "off",
-        ):
-            try:
-                import torch  # type: ignore
-
-                torch_mod = torch
-            except ImportError:
-                torch_mod = None
-
-        if torch_mod is not None:
-            for arg in ir.args:
-                if arg.kind != "buffer":
-                    continue
-                v = runtime_args[arg.name]
-                if isinstance(v, torch_mod.Tensor) and v.device.type == "mps":
-                    torch_mps_sync_needed = True
-                    break
-
-        if torch_mps_sync_needed:
-            # Enterprise-safe default: ensure all prior torch(mps) work is visible
-            # before consuming MPS tensors on our Metal command queue.
-            torch_mod.mps.synchronize()
+        torch_mod = self._get_torch()
+        torch_mps_sync_enabled = os.environ.get(
+            "EAS_TORCH_MPS_SYNC", "1"
+        ).strip().lower() not in ("0", "false", "no", "off")
+        torch_mps_synced = False
 
         for arg in ir.args:
             v = runtime_args[arg.name]
             if arg.kind == "buffer":
-                try:
-                    import torch  # type: ignore
-
-                    if isinstance(v, torch.Tensor):
-                        t = v.detach() if getattr(v, "requires_grad", False) else v
-                        if t.dtype != torch.float32:
-                            raise TypeError(
-                                f"{arg.name!r} must be float32, got {t.dtype}"
-                            )
-                        if t.device.type == "mps":
-                            if not t.is_contiguous():
-                                t = t.contiguous()
-                            cap = t.__dlpack__()
-                            buf, _shape = self._mod().dlpack_import(cap)
-                            argv.append(buf)
-                            writable.append(arg.name in writes)
-                            continue
-                        if t.device.type == "cpu":
-                            v = t.contiguous().numpy()
-                        else:
-                            raise TypeError(
-                                f"unsupported torch device for {arg.name!r}: {t.device!s}"
-                            )
-                except ImportError:
-                    pass
+                if torch_mod is not None and isinstance(v, torch_mod.Tensor):
+                    t = v.detach() if getattr(v, "requires_grad", False) else v
+                    if t.dtype != torch_mod.float32:
+                        raise TypeError(f"{arg.name!r} must be float32, got {t.dtype}")
+                    if t.device.type == "mps":
+                        if torch_mps_sync_enabled and not torch_mps_synced:
+                            torch_mod.mps.synchronize()
+                            torch_mps_synced = True
+                        if not t.is_contiguous():
+                            t = t.contiguous()
+                        argv.append(self._torch_mps_tensor_to_metal_buffer(t))
+                        writable.append(arg.name in writes)
+                        continue
+                    if t.device.type == "cpu":
+                        v = t.contiguous().numpy()
+                    else:
+                        raise TypeError(
+                            f"unsupported torch device for {arg.name!r}: {t.device!s}"
+                        )
                 if _is_tensor(v):
                     if getattr(v, "device", None) == "metal":
                         argv.append(v._metal_buffer())  # type: ignore[attr-defined]

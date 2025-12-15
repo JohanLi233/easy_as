@@ -10,6 +10,7 @@ class DType(str, Enum):
     F32 = "f32"
     U32 = "u32"
 
+
 ArgKind: TypeAlias = Literal["buffer", "scalar"]
 
 Op: TypeAlias = Literal[
@@ -74,9 +75,7 @@ def validate_ir(ir: IRModule) -> None:
 
         if inst.op == "arg":
             require(inst.out is not None, "arg must produce a value")
-            require(
-                len(inst.args) == 3, f"arg expects 3 args, got {len(inst.args)}"
-            )
+            require(len(inst.args) == 3, f"arg expects 3 args, got {len(inst.args)}")
             name = str(inst.args[0])
             kind = inst.args[1]
             dtype = inst.args[2]
@@ -92,9 +91,7 @@ def validate_ir(ir: IRModule) -> None:
 
         if inst.op == "const":
             require(inst.out is not None, "const must produce a value")
-            require(
-                len(inst.args) == 1, f"const expects 1 arg, got {len(inst.args)}"
-            )
+            require(len(inst.args) == 1, f"const expects 1 arg, got {len(inst.args)}")
             continue
 
         if inst.op in {"program_id", "thread_id", "arange"}:

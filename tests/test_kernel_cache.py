@@ -43,4 +43,3 @@ class TestKernelCache(unittest.TestCase):
                 os.environ.pop("EAS_BACKEND", None)
             else:
                 os.environ["EAS_BACKEND"] = old
-
