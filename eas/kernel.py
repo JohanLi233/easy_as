@@ -3,7 +3,7 @@ from __future__ import annotations
 import inspect
 from typing import Any, Callable
 
-from .compiler import CompiledKernel, compile as _compile
+from .compiler import CompiledKernel, compile as _compile, runtime_arg_signature
 from .meta import constexpr
 from .runtime import get_runtime
 
@@ -30,21 +30,25 @@ class Kernel:
             raise TypeError(f"_sync must be bool, got {type(sync)!r}")
         return {"sync": sync}
 
-    def compile(self, /, *args: Any, **kwargs: Any) -> CompiledKernel:
-        _ = self._pop_runtime_options(kwargs)
+    def _bind_and_split(
+        self, /, *args: Any, **kwargs: Any
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
         bound = self.sig.bind(*args, **kwargs)
         bound.apply_defaults()
-
         meta = {
             k: bound.arguments.pop(k)
             for k in list(bound.arguments)
             if k in self.meta_params
         }
-        runtime_args = bound.arguments
+        return meta, bound.arguments
+
+    def compile(self, /, *args: Any, **kwargs: Any) -> CompiledKernel:
+        _ = self._pop_runtime_options(kwargs)
+        meta, runtime_args = self._bind_and_split(*args, **kwargs)
 
         cache_key = (
             tuple(sorted(meta.items())),
-            tuple(sorted((k, type(v)) for k, v in runtime_args.items())),
+            runtime_arg_signature(runtime_args),
         )
         cached = self._cache.get(cache_key)
         if cached is not None:
@@ -57,14 +61,7 @@ class Kernel:
     def __call__(self, /, *args: Any, **kwargs: Any) -> None:
         runtime_opts = self._pop_runtime_options(kwargs)
         ck = self.compile(*args, **kwargs)
-        bound = self.sig.bind(*args, **kwargs)
-        bound.apply_defaults()
-        meta = {
-            k: bound.arguments.pop(k)
-            for k in list(bound.arguments)
-            if k in self.meta_params
-        }
-        runtime_args = bound.arguments
+        meta, runtime_args = self._bind_and_split(*args, **kwargs)
         get_runtime().run(ck, runtime_args, meta, **runtime_opts)
 
     def to_msl(self, /, *args: Any, **kwargs: Any) -> str:

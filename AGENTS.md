@@ -36,3 +36,4 @@
 
 - 项目使用uv作为包管理器
 - codex运行在sandbox内，没有mps，如果需要运行性能测试，必须通知用户来进行
+- use `uv run` instead of python3 or python

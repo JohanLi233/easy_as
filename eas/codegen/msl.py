@@ -41,6 +41,7 @@ def _ref(ctx: _Ctx, v: ValueRef) -> str:
 def ir_to_msl(ir: IRModule) -> tuple[str, int]:
     arg_names: dict[int, str] = {}
     uses_store: set[str] = set()
+    def_by_id: dict[int, Any] = {}
 
     # Extract arg name mapping and store targets.
     for inst in ir.insts:
@@ -48,15 +49,151 @@ def ir_to_msl(ir: IRModule) -> tuple[str, int]:
             assert inst.out is not None
             name = str(inst.args[0])
             arg_names[inst.out.id] = name
+            def_by_id[inst.out.id] = inst
         elif inst.op == "store":
             buf_ref: ValueRef = inst.args[0]
             buf_name = arg_names.get(buf_ref.id)
             if buf_name is not None:
                 uses_store.add(buf_name)
+        elif inst.out is not None:
+            def_by_id[inst.out.id] = inst
 
     ctx = _Ctx(arg_names=arg_names, uses_store=uses_store)
 
     threadgroup_size = _infer_threadgroup_size(ir)
+
+    use_counts: dict[int, int] = {}
+    for inst in ir.insts:
+        for a in inst.args:
+            if isinstance(a, ValueRef):
+                use_counts[a.id] = use_counts.get(a.id, 0) + 1
+
+    def _is_const_bool(v: ValueRef, expected: bool) -> bool:
+        inst = def_by_id.get(v.id)
+        return bool(
+            inst is not None
+            and inst.op == "const"
+            and isinstance(inst.args[0], bool)
+            and bool(inst.args[0]) is expected
+        )
+
+    def _lifted_region_by_store_idx() -> dict[int, list[int]]:
+        def_idx: dict[int, int] = {}
+        for i, inst in enumerate(ir.insts):
+            if inst.out is not None:
+                def_idx[inst.out.id] = i
+
+        uses: dict[int, set[int]] = {}
+
+        def _add_use(v: ValueRef, idx: int) -> None:
+            uses.setdefault(v.id, set()).add(idx)
+
+        for i, inst in enumerate(ir.insts):
+            for a in inst.args:
+                if isinstance(a, ValueRef):
+                    _add_use(a, i)
+
+        def _deps(value_id: int, out: set[int]) -> None:
+            if value_id in out:
+                return
+            out.add(value_id)
+            inst = def_by_id.get(value_id)
+            if inst is None or inst.op == "arg":
+                return
+            for a in inst.args:
+                if isinstance(a, ValueRef):
+                    _deps(a.id, out)
+
+        moved: set[int] = set()
+        lifted: dict[int, list[int]] = {}
+
+        for store_idx, inst in enumerate(ir.insts):
+            if inst.op != "store":
+                continue
+            buf_ref, off_ref, val_ref, mask_ref = inst.args  # type: ignore[misc]
+            if _is_const_bool(mask_ref, True):
+                continue
+
+            mask_ids: set[int] = set()
+            _deps(mask_ref.id, mask_ids)
+            off_ids: set[int] = set()
+            _deps(off_ref.id, off_ids)
+            anchor_ids = mask_ids | off_ids
+
+            val_ids: set[int] = set()
+            _deps(val_ref.id, val_ids)
+
+            candidate_ids = val_ids - anchor_ids
+            if not candidate_ids:
+                continue
+
+            candidate_inst_idxs: set[int] = set()
+            ok = True
+            for value_id in candidate_ids:
+                idx = def_idx.get(value_id)
+                if idx is None:
+                    continue
+                if idx >= store_idx:
+                    ok = False
+                    break
+                if idx in moved:
+                    ok = False
+                    break
+                def_inst = ir.insts[idx]
+                if def_inst.op in {"arg", "program_id", "thread_id", "arange"}:
+                    continue
+                if def_inst.op == "load":
+                    _buf, _off, load_mask = def_inst.args  # type: ignore[misc]
+                    if load_mask.id != mask_ref.id:
+                        ok = False
+                        break
+                elif def_inst.op in {"add", "mul", "lt", "where", "const"}:
+                    pass
+                else:
+                    ok = False
+                    break
+                candidate_inst_idxs.add(idx)
+
+            if not ok or not candidate_inst_idxs:
+                continue
+
+            allowed_users = candidate_inst_idxs | {store_idx}
+            moved_value_ids = {
+                ir.insts[i].out.id for i in candidate_inst_idxs if ir.insts[i].out is not None
+            }
+            for value_id in moved_value_ids:
+                for user_idx in uses.get(value_id, set()):
+                    if user_idx not in allowed_users:
+                        ok = False
+                        break
+                if not ok:
+                    break
+
+            if not ok:
+                continue
+
+            ordered = sorted(candidate_inst_idxs)
+            lifted[store_idx] = ordered
+            moved.update(candidate_inst_idxs)
+
+        return lifted
+
+    lifted_by_store = _lifted_region_by_store_idx()
+
+    needs_tgpig = False
+    needs_tpitg = False
+    needs_tpig = False
+    for inst in ir.insts:
+        if inst.out is None:
+            continue
+        if use_counts.get(inst.out.id, 0) == 0:
+            continue
+        if inst.op == "program_id":
+            needs_tgpig = True
+        elif inst.op == "arange":
+            needs_tpitg = True
+        elif inst.op == "thread_id":
+            needs_tpig = True
 
     lines: list[str] = []
     lines.append("#include <metal_stdlib>")
@@ -77,41 +214,55 @@ def ir_to_msl(ir: IRModule) -> tuple[str, int]:
             )
         buf_index += 1
 
-    params.append("uint3 tgpig [[threadgroup_position_in_grid]]")
-    params.append("uint3 tpitg [[thread_position_in_threadgroup]]")
+    if needs_tpig:
+        params.append("uint3 tpig [[thread_position_in_grid]]")
+    if needs_tgpig:
+        params.append("uint3 tgpig [[threadgroup_position_in_grid]]")
+    if needs_tpitg:
+        params.append("uint3 tpitg [[thread_position_in_threadgroup]]")
 
     lines.append(",\n".join(f"    {p}" for p in params))
     lines.append(") {")
 
     # emit body
-    for inst in ir.insts:
+    moved_inst_idxs = {idx for idxs in lifted_by_store.values() for idx in idxs}
+
+    def _emit_inst(inst: Any, *, indent: str, in_guard_for_mask: ValueRef | None) -> None:
         if inst.op in {"arg"}:
-            continue
+            return
         if inst.op == "const":
             out = inst.out
             assert out is not None
             lines.append(
-                f"  {_msl_type(out.dtype)} v{out.id} = {_const_literal(inst.args[0])};"
+                f"{indent}{_msl_type(out.dtype)} v{out.id} = {_const_literal(inst.args[0])};"
             )
-            continue
+            return
         if inst.op == "program_id":
             out = inst.out
             assert out is not None
             axis = int(inst.args[0])
             if axis != 0:
                 raise ValueError("only program_id(0) is supported in MVP")
-            lines.append(f"  uint v{out.id} = tgpig.x;")
-            continue
+            lines.append(f"{indent}uint v{out.id} = tgpig.x;")
+            return
+        if inst.op == "thread_id":
+            out = inst.out
+            assert out is not None
+            axis = int(inst.args[0])
+            if axis != 0:
+                raise ValueError("only thread_id(0) is supported in MVP")
+            lines.append(f"{indent}uint v{out.id} = tpig.x;")
+            return
         if inst.op == "arange":
             out = inst.out
             assert out is not None
             start, size = (int(inst.args[0]), int(inst.args[1]))
             _ = size
             if start != 0:
-                lines.append(f"  uint v{out.id} = (uint)({start}) + tpitg.x;")
+                lines.append(f"{indent}uint v{out.id} = (uint)({start}) + tpitg.x;")
             else:
-                lines.append(f"  uint v{out.id} = tpitg.x;")
-            continue
+                lines.append(f"{indent}uint v{out.id} = tpitg.x;")
+            return
         if inst.op in {"add", "mul", "lt"}:
             out = inst.out
             assert out is not None
@@ -120,34 +271,71 @@ def ir_to_msl(ir: IRModule) -> tuple[str, int]:
             a, b = inst.args  # type: ignore[misc]
             op = {"add": "+", "mul": "*", "lt": "<"}[inst.op]
             lines.append(
-                f"  {_msl_type(out.dtype)} v{out.id} = {_ref(ctx, a)} {op} {_ref(ctx, b)};"
+                f"{indent}{_msl_type(out.dtype)} v{out.id} = {_ref(ctx, a)} {op} {_ref(ctx, b)};"
             )
-            continue
+            return
         if inst.op == "where":
             out = inst.out
             assert out is not None
             c, a, b = inst.args  # type: ignore[misc]
             lines.append(
-                f"  {_msl_type(out.dtype)} v{out.id} = {_ref(ctx, c)} ? {_ref(ctx, a)} : {_ref(ctx, b)};"
+                f"{indent}{_msl_type(out.dtype)} v{out.id} = {_ref(ctx, c)} ? {_ref(ctx, a)} : {_ref(ctx, b)};"
             )
-            continue
+            return
         if inst.op == "load":
             out = inst.out
             assert out is not None
             buf_ref, off_ref, mask_ref = inst.args  # type: ignore[misc]
             buf_name = ctx.arg_names[buf_ref.id]
-            lines.append(
-                f"  float v{out.id} = {_ref(ctx, mask_ref)} ? {buf_name}[{_ref(ctx, off_ref)}] : 0.0f;"
-            )
-            continue
+
+            if in_guard_for_mask is not None and mask_ref.id == in_guard_for_mask.id:
+                lines.append(
+                    f"{indent}float v{out.id} = {buf_name}[{_ref(ctx, off_ref)}];"
+                )
+            elif _is_const_bool(mask_ref, True):
+                lines.append(
+                    f"{indent}float v{out.id} = {buf_name}[{_ref(ctx, off_ref)}];"
+                )
+            else:
+                lines.append(f"{indent}float v{out.id} = 0.0f;")
+                lines.append(
+                    f"{indent}if ({_ref(ctx, mask_ref)}) {{ v{out.id} = {buf_name}[{_ref(ctx, off_ref)}]; }}"
+                )
+            return
         if inst.op == "store":
             buf_ref, off_ref, val_ref, mask_ref = inst.args  # type: ignore[misc]
             buf_name = ctx.arg_names[buf_ref.id]
-            lines.append(
-                f"  if ({_ref(ctx, mask_ref)}) {{ {buf_name}[{_ref(ctx, off_ref)}] = {_ref(ctx, val_ref)}; }}"
-            )
-            continue
+            if in_guard_for_mask is not None and mask_ref.id == in_guard_for_mask.id:
+                lines.append(
+                    f"{indent}{buf_name}[{_ref(ctx, off_ref)}] = {_ref(ctx, val_ref)};"
+                )
+            else:
+                lines.append(
+                    f"{indent}if ({_ref(ctx, mask_ref)}) {{ {buf_name}[{_ref(ctx, off_ref)}] = {_ref(ctx, val_ref)}; }}"
+                )
+            return
         raise ValueError(f"unsupported op: {inst.op}")
+
+    for idx, inst in enumerate(ir.insts):
+        if inst.out is not None and use_counts.get(inst.out.id, 0) == 0 and inst.op != "store":
+            # Skip unused SSA defs (notably arange kept for threadgroup_size).
+            continue
+        if idx in moved_inst_idxs:
+            continue
+
+        if inst.op in {"arg"}:
+            continue
+        if inst.op == "store" and idx in lifted_by_store:
+            _buf_ref, _off_ref, _val_ref, mask_ref = inst.args  # type: ignore[misc]
+            lines.append(f"  if ({_ref(ctx, mask_ref)}) {{")
+            for moved_idx in lifted_by_store[idx]:
+                _emit_inst(
+                    ir.insts[moved_idx], indent="    ", in_guard_for_mask=mask_ref
+                )
+            _emit_inst(inst, indent="    ", in_guard_for_mask=mask_ref)
+            lines.append("  }")
+        else:
+            _emit_inst(inst, indent="  ", in_guard_for_mask=None)
 
     lines.append("}")
     return ("\n".join(lines) + "\n", threadgroup_size)

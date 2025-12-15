@@ -10,6 +10,7 @@ import numpy as np
 
 from ..ir import DType, IRModule
 from .metal_ext import load_metal_ext
+from .grid import infer_1d_grid
 
 
 def _is_tensor(v: Any) -> bool:
@@ -93,10 +94,7 @@ class MetalRuntime:
         ir: IRModule = ck.ir
         threadgroup_size: int = ck.threadgroup_size
 
-        if "N" not in runtime_args:
-            raise ValueError("MVP metal runtime requires a scalar argument named 'N'")
-        n = int(runtime_args["N"])
-        grid = (n + threadgroup_size - 1) // threadgroup_size
+        grid = infer_1d_grid(runtime_args, threadgroup_size)
         writes = ck.writes
 
         argv: list[object] = []

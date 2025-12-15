@@ -8,7 +8,28 @@ import numpy as np
 
 from . import mk
 from .analysis import infer_writes
-from .ir import Arg, DType, IRModule, Inst, ValueRef
+from .ir import Arg, ArgKind, DType, IRModule, Inst, ValueRef, validate_ir
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeArgSig:
+    kind: ArgKind
+    dtype: DType
+    device: str | None = None
+
+
+def runtime_arg_signature(runtime_args: Mapping[str, Any]) -> tuple[tuple[str, Any], ...]:
+    """
+    Return a stable signature for runtime args for kernel caching.
+
+    The goal is to recompile when the traced types/layouts *could* change, while
+    ignoring runtime values for scalars (they do not affect tracing).
+    """
+    sigs: list[tuple[str, Any]] = []
+    for name, value in runtime_args.items():
+        sig = _runtime_arg_sig(value)
+        sigs.append((name, (sig.kind, sig.dtype, sig.device)))
+    return tuple(sorted(sigs))
 
 
 def _scalar_dtype(v: Any) -> DType:
@@ -16,6 +37,8 @@ def _scalar_dtype(v: Any) -> DType:
         return DType.BOOL
     if isinstance(v, (int, np.integer)):
         return DType.U32
+    if isinstance(v, (float, np.floating)):
+        return DType.F32
     raise TypeError(f"unsupported scalar type: {type(v)!r}")
 
 
@@ -56,6 +79,25 @@ def _tensor_dtype(v: Any) -> DType:
     if np.dtype(dt) == np.float32:
         return DType.F32
     raise TypeError(f"unsupported tensor dtype: {dt} (expected float32)")
+
+
+def _runtime_arg_sig(v: Any) -> RuntimeArgSig:
+    if isinstance(v, np.ndarray):
+        return RuntimeArgSig(kind="buffer", dtype=_buffer_dtype(v), device="cpu")
+    if _is_tensor(v):
+        device = str(getattr(v, "device", None)) if getattr(v, "device", None) else None
+        return RuntimeArgSig(kind="buffer", dtype=_tensor_dtype(v), device=device)
+    if _is_torch_tensor(v):
+        try:
+            import torch  # type: ignore
+
+            dt = _torch_buffer_dtype(v)
+            dev = str(v.device.type) if isinstance(v, torch.Tensor) else None
+        except Exception:
+            dt = DType.F32
+            dev = None
+        return RuntimeArgSig(kind="buffer", dtype=dt, device=dev)
+    return RuntimeArgSig(kind="scalar", dtype=_scalar_dtype(v), device=None)
 
 
 @dataclass(slots=True)
@@ -147,7 +189,11 @@ class _IRBuilder:
             raise TypeError("load(buffer, ...) expects a kernel argument (buffer)")
         offv = self._coerce(offset)
         maskv = self._coerce(True if mask is None else mask)
-        out = self._new(DType.F32)
+        if offv.dtype != DType.U32:
+            raise TypeError(f"load offset must be u32, got {offv.dtype}")
+        if maskv.dtype != DType.BOOL:
+            raise TypeError(f"load mask must be bool, got {maskv.dtype}")
+        out = self._new(buffer.dtype)
         self.insts.append(Inst("load", out.ref, (buffer.ref, offv.ref, maskv.ref)))
         return out
 
@@ -157,6 +203,12 @@ class _IRBuilder:
         offv = self._coerce(offset)
         valv = self._coerce(value)
         maskv = self._coerce(True if mask is None else mask)
+        if offv.dtype != DType.U32:
+            raise TypeError(f"store offset must be u32, got {offv.dtype}")
+        if maskv.dtype != DType.BOOL:
+            raise TypeError(f"store mask must be bool, got {maskv.dtype}")
+        if valv.dtype != buffer.dtype:
+            raise TypeError(f"store dtype mismatch: {buffer.dtype} vs {valv.dtype}")
         self.insts.append(
             Inst("store", None, (buffer.ref, offv.ref, valv.ref, maskv.ref))
         )
@@ -182,7 +234,7 @@ def trace_to_ir(
                 dtype = _tensor_dtype(value)
             arg = Arg(name=name, dtype=dtype, kind="buffer")
             builder.args.append(arg)
-            v = builder._new(DType.F32)
+            v = builder._new(arg.dtype)
             builder.insts.append(Inst("arg", v.ref, (name, arg.kind, arg.dtype)))
             trace_kwargs[name] = v
         else:
@@ -240,6 +292,8 @@ def compile(
     fn: Callable[..., Any], runtime_args: Mapping[str, Any], meta: Mapping[str, Any]
 ) -> CompiledKernel:
     ir = trace_to_ir(fn, runtime_args, meta)
+    ir = _optimize_ir(ir)
+    validate_ir(ir)
     from .codegen.msl import ir_to_msl
 
     msl_src, threadgroup_size = ir_to_msl(ir)
@@ -247,3 +301,205 @@ def compile(
     return CompiledKernel(
         ir=ir, msl=msl_src, threadgroup_size=threadgroup_size, writes=writes
     )
+
+
+def _optimize_ir(ir: IRModule) -> IRModule:
+    ir = _rewrite_thread_id(ir)
+    ir = _cse_pure(ir)
+    ir = _dce(ir)
+    return ir
+
+
+def _rewrite_thread_id(ir: IRModule) -> IRModule:
+    def_by_id: dict[int, Inst] = {}
+    for inst in ir.insts:
+        if inst.out is not None:
+            def_by_id[inst.out.id] = inst
+
+    new_insts: list[Inst] = []
+    for inst in ir.insts:
+        if inst.op != "add" or inst.out is None:
+            new_insts.append(inst)
+            continue
+
+        a_ref, b_ref = inst.args  # type: ignore[misc]
+        if not isinstance(a_ref, ValueRef) or not isinstance(b_ref, ValueRef):
+            new_insts.append(inst)
+            continue
+
+        def _match(mul_ref: ValueRef, arange_ref: ValueRef) -> bool:
+            mul_inst = def_by_id.get(mul_ref.id)
+            arange_inst = def_by_id.get(arange_ref.id)
+            if mul_inst is None or arange_inst is None:
+                return False
+            if mul_inst.op != "mul" or mul_inst.out is None:
+                return False
+            if arange_inst.op != "arange" or arange_inst.out is None:
+                return False
+
+            start, size = (int(arange_inst.args[0]), int(arange_inst.args[1]))
+            if start != 0:
+                return False
+
+            x_ref, y_ref = mul_inst.args  # type: ignore[misc]
+            if not isinstance(x_ref, ValueRef) or not isinstance(y_ref, ValueRef):
+                return False
+
+            def _is_pid(ref: ValueRef) -> bool:
+                pid_inst = def_by_id.get(ref.id)
+                return bool(
+                    pid_inst is not None
+                    and pid_inst.op == "program_id"
+                    and int(pid_inst.args[0]) == 0
+                )
+
+            def _is_block_const(ref: ValueRef) -> bool:
+                const_inst = def_by_id.get(ref.id)
+                return bool(
+                    const_inst is not None
+                    and const_inst.op == "const"
+                    and isinstance(const_inst.args[0], int)
+                    and int(const_inst.args[0]) == size
+                )
+
+            return (_is_pid(x_ref) and _is_block_const(y_ref)) or (
+                _is_pid(y_ref) and _is_block_const(x_ref)
+            )
+
+        if _match(a_ref, b_ref) or _match(b_ref, a_ref):
+            new_insts.append(Inst("thread_id", inst.out, (0,)))
+        else:
+            new_insts.append(inst)
+
+    return IRModule(name=ir.name, args=ir.args, insts=tuple(new_insts))
+
+
+def _cse_pure(ir: IRModule) -> IRModule:
+    id_to_ref: dict[int, ValueRef] = {}
+    value_numbering: dict[tuple[object, ...], ValueRef] = {}
+    new_insts: list[Inst] = []
+
+    def _remap_arg(a: Any) -> Any:
+        if isinstance(a, ValueRef):
+            return id_to_ref.get(a.id, a)
+        return a
+
+    def _key_for(inst: Inst, out: ValueRef) -> tuple[object, ...] | None:
+        if inst.op == "const":
+            return ("const", out.dtype, inst.args[0])
+        if inst.op in {"program_id", "thread_id"}:
+            return (inst.op, out.dtype, int(inst.args[0]))
+        if inst.op == "arange":
+            return ("arange", out.dtype, int(inst.args[0]), int(inst.args[1]))
+        if inst.op in {"add", "mul"}:
+            a_ref, b_ref = (_remap_arg(inst.args[0]), _remap_arg(inst.args[1]))
+            assert isinstance(a_ref, ValueRef) and isinstance(b_ref, ValueRef)
+            x, y = (a_ref, b_ref) if a_ref.id <= b_ref.id else (b_ref, a_ref)
+            return (inst.op, out.dtype, x.id, y.id)
+        if inst.op == "lt":
+            a_ref, b_ref = (_remap_arg(inst.args[0]), _remap_arg(inst.args[1]))
+            assert isinstance(a_ref, ValueRef) and isinstance(b_ref, ValueRef)
+            return ("lt", out.dtype, a_ref.id, b_ref.id)
+        if inst.op == "where":
+            c_ref, a_ref, b_ref = map(_remap_arg, inst.args)
+            assert isinstance(c_ref, ValueRef)
+            assert isinstance(a_ref, ValueRef)
+            assert isinstance(b_ref, ValueRef)
+            return ("where", out.dtype, c_ref.id, a_ref.id, b_ref.id)
+        return None
+
+    for inst in ir.insts:
+        remapped_args = tuple(_remap_arg(a) for a in inst.args)
+
+        if inst.op == "arg":
+            assert inst.out is not None
+            id_to_ref[inst.out.id] = inst.out
+            new_insts.append(Inst(inst.op, inst.out, remapped_args))
+            continue
+
+        if inst.op in {"store", "load"}:
+            if inst.out is not None:
+                id_to_ref[inst.out.id] = inst.out
+            new_insts.append(Inst(inst.op, inst.out, remapped_args))
+            continue
+
+        if inst.out is None:
+            new_insts.append(Inst(inst.op, None, remapped_args))
+            continue
+
+        out = inst.out
+        key = _key_for(Inst(inst.op, inst.out, remapped_args), out)
+        if key is not None and key in value_numbering:
+            id_to_ref[out.id] = value_numbering[key]
+            continue
+
+        if key is not None:
+            value_numbering[key] = out
+        id_to_ref[out.id] = out
+        new_insts.append(Inst(inst.op, out, remapped_args))
+
+    return IRModule(name=ir.name, args=ir.args, insts=tuple(new_insts))
+
+
+def _dce(ir: IRModule) -> IRModule:
+    def_idx: dict[int, int] = {}
+    for i, inst in enumerate(ir.insts):
+        if inst.out is not None:
+            def_idx[inst.out.id] = i
+
+    uses: dict[int, set[int]] = {}
+
+    def _add_use(v: ValueRef, user_idx: int) -> None:
+        uses.setdefault(v.id, set()).add(user_idx)
+
+    for i, inst in enumerate(ir.insts):
+        for a in inst.args:
+            if isinstance(a, ValueRef):
+                _add_use(a, i)
+
+    live_ids: set[int] = set()
+
+    def _mark(v: ValueRef) -> None:
+        live_ids.add(v.id)
+
+    # Roots: side effects and required metadata.
+    for inst in ir.insts:
+        if inst.op == "store":
+            buf_ref, off_ref, val_ref, mask_ref = inst.args  # type: ignore[misc]
+            _mark(buf_ref)
+            _mark(off_ref)
+            _mark(val_ref)
+            _mark(mask_ref)
+        elif inst.op == "arange":
+            # Keep arange even if its SSA result is unused: it defines threadgroup_size.
+            assert inst.out is not None
+            live_ids.add(inst.out.id)
+        elif inst.op == "arg":
+            assert inst.out is not None
+            live_ids.add(inst.out.id)
+
+    changed = True
+    while changed:
+        changed = False
+        for value_id in tuple(live_ids):
+            idx = def_idx.get(value_id)
+            if idx is None:
+                continue
+            inst = ir.insts[idx]
+            for a in inst.args:
+                if isinstance(a, ValueRef) and a.id not in live_ids:
+                    live_ids.add(a.id)
+                    changed = True
+
+    new_insts: list[Inst] = []
+    for inst in ir.insts:
+        if inst.op in {"arg", "store", "arange"}:
+            new_insts.append(inst)
+            continue
+        if inst.out is None:
+            new_insts.append(inst)
+            continue
+        if inst.out.id in live_ids:
+            new_insts.append(inst)
+
+    return IRModule(name=ir.name, args=ir.args, insts=tuple(new_insts))

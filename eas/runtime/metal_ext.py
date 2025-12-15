@@ -21,6 +21,7 @@ def load_metal_ext(*, require: bool) -> Any | None:
         "is_available",
         "compile",
         "launch",
+        "synchronize",
         "alloc_buffer",
         "copy_from_host",
         "copy_to_host",
