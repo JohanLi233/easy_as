@@ -10,6 +10,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+torch = [
+    "torch",
+]
 dev = [
     "torch",
     "pytest",

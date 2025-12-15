@@ -51,4 +51,3 @@ class TestTensorMetal(unittest.TestCase):
         c = eas.empty_like(a)
         add_kernel(a, b, c, n, BLOCK=256)
         np.testing.assert_allclose(c.numpy(), a_np + b_np)
-

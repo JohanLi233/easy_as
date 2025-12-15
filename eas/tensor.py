@@ -3,11 +3,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Literal, overload
 
+import os
+
 import numpy as np
 
 from .runtime.metal_ext import load_metal_ext
 
 Device = Literal["cpu", "metal"]
+
 
 def _torch() -> Any | None:
     try:
@@ -114,6 +117,29 @@ class Tensor:
             return arr
         return arr.astype(dtype, copy=False)
 
+    def __dlpack__(self, stream: Any | None = None) -> Any:
+        _ = stream
+        if self._device == "cpu":
+            arr = self._cpu
+            assert arr is not None
+            return arr.__dlpack__()
+        metal = self._metal
+        assert metal is not None
+        mod = load_metal_ext(require=True)
+        if not callable(getattr(mod, "dlpack_export", None)):
+            raise RuntimeError(
+                "Metal extension `eas._metal` is missing DLPack export API; rebuild it with "
+                "`python3 tools/build_metal_ext.py`."
+            )
+        return mod.dlpack_export(metal.buf, self._shape)
+
+    def __dlpack_device__(self) -> tuple[int, int]:
+        if self._device == "cpu":
+            # DLPack DLDeviceType.kDLCPU = 1
+            return (1, 0)
+        # DLPack DLDeviceType.kDLMetal = 8
+        return (8, 0)
+
     def numpy(self) -> np.ndarray:
         if self._device == "cpu":
             arr = self._cpu
@@ -134,7 +160,9 @@ class Tensor:
     def to_torch(self, device: str | None = None) -> Any:
         torch = _torch()
         if torch is None:
-            raise RuntimeError("torch is not available; install it to use Tensor.to_torch()")
+            raise RuntimeError(
+                "torch is not available; install it to use Tensor.to_torch()"
+            )
 
         if device is None:
             device = "cpu" if self._device == "cpu" else "mps"
@@ -145,7 +173,11 @@ class Tensor:
         if device_l == "cpu":
             return torch.from_numpy(self.numpy())
 
-        # Best-effort: round-trip through host for now.
+        if self._device == "metal":
+            from torch.utils import dlpack  # type: ignore
+
+            return dlpack.from_dlpack(self)
+
         return torch.from_numpy(self.numpy()).to("mps")
 
     def to(self, device: Device | str) -> Tensor:
@@ -153,7 +185,9 @@ class Tensor:
         if device_n == self._device:
             return self
         if device_n == "cpu":
-            return Tensor(shape=self._shape, dtype=self._dtype, device="cpu", cpu=self.numpy())
+            return Tensor(
+                shape=self._shape, dtype=self._dtype, device="cpu", cpu=self.numpy()
+            )
 
         # cpu -> metal
         mod = load_metal_ext(require=True)
@@ -164,7 +198,9 @@ class Tensor:
                 "Metal extension `eas._metal` is missing tensor allocation/copy API; rebuild it with "
                 "`python3 tools/build_metal_ext.py`."
             )
-        if not callable(getattr(mod, "is_available", None)) or not bool(mod.is_available()):
+        if not callable(getattr(mod, "is_available", None)) or not bool(
+            mod.is_available()
+        ):
             raise RuntimeError("Metal device is not available")
 
         buf = mod.alloc_buffer(int(self.nbytes), "private")
@@ -212,11 +248,39 @@ def tensor(
         if t.dtype != torch.float32:
             t = t.to(dtype=torch.float32)
 
+        if device_n == "metal" and t.device.type == "mps":
+            if os.environ.get("EAS_TORCH_MPS_SYNC", "1").strip().lower() not in (
+                "0",
+                "false",
+                "no",
+                "off",
+            ):
+                torch.mps.synchronize()
+            if not t.is_contiguous():
+                t = t.contiguous()
+            mod = load_metal_ext(require=True)
+            if not callable(getattr(mod, "dlpack_import", None)):
+                raise RuntimeError(
+                    "Metal extension `eas._metal` is missing DLPack import API; rebuild it with "
+                    "`python3 tools/build_metal_ext.py`."
+                )
+            cap = t.__dlpack__()
+            buf, shape = mod.dlpack_import(cap)
+            shape_t = tuple(int(d) for d in shape)
+            nbytes = _numel(shape_t) * 4
+            return Tensor(
+                shape=shape_t,
+                dtype=np.float32,
+                device="metal",
+                metal=_MetalStorage(buf=buf, nbytes=nbytes, storage="private"),
+            )
+
         if t.device.type != "cpu":
             t = t.to("cpu")
-        # .numpy() shares memory with CPU tensors.
         cpu_arr = t.contiguous().numpy()
-        cpu_t = Tensor(shape=tuple(cpu_arr.shape), dtype=np.float32, device="cpu", cpu=cpu_arr)
+        cpu_t = Tensor(
+            shape=tuple(cpu_arr.shape), dtype=np.float32, device="cpu", cpu=cpu_arr
+        )
         return cpu_t.to(device_n)
 
     if isinstance(data, Tensor):

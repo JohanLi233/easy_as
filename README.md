@@ -1,8 +1,8 @@
 # easy_as
 
-Python-first kernel DSL (tracing) → IR → Metal Shading Language (MSL) codegen, with Metal + CPU runtimes.
+Python优先的内核 DSL（追踪）→ IR → Metal Shading Language (MSL) 代码生成，配备 Metal + CPU 运行时。
 
-## Quickstart: elementwise add
+## 快速开始：元素级加法
 
 ```python
 import numpy as np
@@ -27,9 +27,9 @@ add_kernel(a, b, c, n, BLOCK=256)
 print(add_kernel.to_msl(a, b, c, n, BLOCK=256))
 ```
 
-## Device tensors (torch-style)
+## 设备张量（torch风格）
 
-For performance on Metal, keep buffers resident on the device:
+为了在 Metal 上获得性能，请将缓冲区保留在设备上：
 
 ```python
 import numpy as np
@@ -44,57 +44,75 @@ add_kernel(a, b, c, n, BLOCK=256)
 out = c.numpy()
 ```
 
-Run the example:
+运行示例：
 
 ```bash
 python3 -m examples.add
 ```
 
-Run tests:
+运行测试：
 
 ```bash
 python3 -m unittest discover -s tests -p "test*.py" -v
 ```
 
-## Metal backend (GPU)
+## Metal 后端（GPU）
 
-Build the `eas._metal` extension (ObjC++):
+构建 `eas._metal` 扩展（ObjC++）：
 
 ```bash
 python3 tools/build_metal_ext.py
 ```
 
-Run with Metal:
+使用 Metal 运行：
 
 ```bash
 EAS_BACKEND=metal python3 -m examples.add
 ```
 
-## Torch interop
+## Torch 互操作
 
-`torch.Tensor` can be converted to `eas.Tensor`:
+`torch.Tensor` 可以转换为 `eas.Tensor`：
 
 ```python
 import torch
 import eas
 
 a = torch.randn(1024, device="cpu", dtype=torch.float32)
-a_e = eas.tensor(a, device="cpu")  # zero-copy on CPU
-b_e = a_e.to("metal")              # upload to Metal (copy)
+a_e = eas.tensor(a, device="cpu")  # CPU 上的零拷贝
+b_e = a_e.to("metal")              # 上传到 Metal（拷贝）
+
+# MPS → Metal：通过 DLPack(kDLMetal) 零拷贝（需 contiguous float32）
+x = torch.randn(1024, device="mps", dtype=torch.float32)
+x_e = eas.tensor(x, device="metal")
 ```
 
-Convert back:
+转换回去：
 
 ```python
-t = b_e.to_torch("mps")            # best-effort; currently round-trips via host
+t = x_e.to_torch("mps")            # Metal → MPS：DLPack 零拷贝
 ```
 
-## Configuration
+## DLPack 互操作
+
+通过 DLPack 实现 CPU 零拷贝交换（当生产者支持时）：
+
+```python
+import eas
+import torch
+
+x = torch.randn(1024, device="cpu", dtype=torch.float32)
+y = eas.from_dlpack(x)             # CPU 上的零拷贝
+z = eas.to_dlpack(y)               # DLPack 胶囊（CPU；torch 风格）
+```
+
+## 配置
 
 - `EAS_BACKEND=auto|cpu|metal`
-- `EAS_MAX_IN_FLIGHT`: max number of in-flight async launches (used when calling kernels with `_sync=False`).
+- `EAS_MAX_IN_FLIGHT`：最大异步启动数量（在使用 `_sync=False` 调用内核时使用）。
 
-## Docs
+## 文档
 
 - `docs/ARCHITECTURE.md`
 - `docs/ROADMAP.md`
+- `docs/TORCH_INTEGRATION.md`

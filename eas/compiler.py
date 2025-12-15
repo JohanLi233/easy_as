@@ -169,7 +169,11 @@ def trace_to_ir(
 
     trace_kwargs: dict[str, Any] = {}
     for name, value in runtime_args.items():
-        if isinstance(value, np.ndarray) or _is_tensor(value) or _is_torch_tensor(value):
+        if (
+            isinstance(value, np.ndarray)
+            or _is_tensor(value)
+            or _is_torch_tensor(value)
+        ):
             if isinstance(value, np.ndarray):
                 dtype = _buffer_dtype(value)
             elif _is_torch_tensor(value):

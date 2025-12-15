@@ -5,6 +5,9 @@
 #import <Metal/Metal.h>
 
 #include <CoreFoundation/CoreFoundation.h>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <mutex>
 
 namespace {
@@ -19,10 +22,46 @@ struct Pipeline {
   void* pso;
 };
 
+struct DLManagedTensor;
+
 struct Buffer {
   void* buf;
   Py_ssize_t nbytes;
+  Py_ssize_t offset;
   int storage;  // 0=shared, 1=private
+  DLManagedTensor* dlpack;  // holds an owned DLManagedTensor (optional)
+};
+
+// Minimal DLPack structs (no external headers).
+// https://dmlc.github.io/dlpack/latest/
+static constexpr int kDLMetal = 8;
+static constexpr uint8_t kDLFloat = 2;
+
+struct DLDevice {
+  int device_type;
+  int device_id;
+};
+
+struct DLDataType {
+  uint8_t code;
+  uint8_t bits;
+  uint16_t lanes;
+};
+
+struct DLTensor {
+  void* data;
+  DLDevice device;
+  int ndim;
+  DLDataType dtype;
+  int64_t* shape;
+  int64_t* strides;
+  uint64_t byte_offset;
+};
+
+struct DLManagedTensor {
+  DLTensor dl_tensor;
+  void* manager_ctx;
+  void (*deleter)(DLManagedTensor* self);
 };
 
 struct Pending {
@@ -39,6 +78,15 @@ static void buffer_capsule_destructor(PyObject* capsule) {
     return;
   }
   auto* b = static_cast<Buffer*>(ptr);
+  if (b->dlpack) {
+    if (b->dlpack->deleter) {
+      b->dlpack->deleter(b->dlpack);
+    }
+    b->dlpack = nullptr;
+    b->buf = nullptr;
+    delete b;
+    return;
+  }
   @autoreleasepool {
     if (b->buf) {
       CFRelease(b->buf);
@@ -234,7 +282,9 @@ static PyObject* alloc_buffer(PyObject* /*self*/, PyObject* args) {
     auto* b = new Buffer();
     b->buf = (__bridge_retained void*)buf;
     b->nbytes = (Py_ssize_t)nbytes_ll;
+    b->offset = 0;
     b->storage = storage_tag;
+    b->dlpack = nullptr;
     return PyCapsule_New(b, kBufferCapsuleName, buffer_capsule_destructor);
   }
 }
@@ -251,7 +301,12 @@ static bool copy_from_host_impl(Buffer* b, Py_buffer* src_view) {
   @autoreleasepool {
     id<MTLBuffer> dst = (__bridge id<MTLBuffer>)b->buf;
     if (b->storage == 0) {
-      memcpy(dst.contents, src_view->buf, (size_t)src_view->len);
+      char* base = static_cast<char*>(dst.contents);
+      if (!base) {
+        PyErr_SetString(PyExc_RuntimeError, "MTLBuffer contents is null");
+        return false;
+      }
+      memcpy(base + b->offset, src_view->buf, (size_t)src_view->len);
       return true;
     }
     id<MTLDevice> device = get_device();
@@ -277,7 +332,11 @@ static bool copy_from_host_impl(Buffer* b, Py_buffer* src_view) {
       PyErr_SetString(PyExc_RuntimeError, "failed to create MTLBlitCommandEncoder");
       return false;
     }
-    [blit copyFromBuffer:staging sourceOffset:0 toBuffer:dst destinationOffset:0 size:(NSUInteger)src_view->len];
+    [blit copyFromBuffer:staging
+            sourceOffset:0
+                toBuffer:dst
+       destinationOffset:(NSUInteger)b->offset
+                    size:(NSUInteger)src_view->len];
     [blit endEncoding];
     [cb commit];
     [cb waitUntilCompleted];
@@ -303,7 +362,12 @@ static bool copy_to_host_impl(Buffer* b, Py_buffer* dst_view) {
   @autoreleasepool {
     id<MTLBuffer> src = (__bridge id<MTLBuffer>)b->buf;
     if (b->storage == 0) {
-      memcpy(dst_view->buf, src.contents, (size_t)b->nbytes);
+      char* base = static_cast<char*>(src.contents);
+      if (!base) {
+        PyErr_SetString(PyExc_RuntimeError, "MTLBuffer contents is null");
+        return false;
+      }
+      memcpy(dst_view->buf, base + b->offset, (size_t)b->nbytes);
       return true;
     }
     id<MTLDevice> device = get_device();
@@ -327,7 +391,11 @@ static bool copy_to_host_impl(Buffer* b, Py_buffer* dst_view) {
       PyErr_SetString(PyExc_RuntimeError, "failed to create MTLBlitCommandEncoder");
       return false;
     }
-    [blit copyFromBuffer:src sourceOffset:0 toBuffer:staging destinationOffset:0 size:(NSUInteger)b->nbytes];
+    [blit copyFromBuffer:src
+            sourceOffset:(NSUInteger)b->offset
+                toBuffer:staging
+       destinationOffset:0
+                    size:(NSUInteger)b->nbytes];
     [blit endEncoding];
     [cb commit];
     [cb waitUntilCompleted];
@@ -386,6 +454,342 @@ static PyObject* copy_to_host(PyObject* /*self*/, PyObject* args) {
     return nullptr;
   }
   Py_RETURN_NONE;
+}
+
+static bool dlpack_is_f32(const DLDataType& dt) {
+  return dt.code == kDLFloat && dt.bits == 32 && dt.lanes == 1;
+}
+
+static bool dlpack_is_c_contig(const DLTensor& t) {
+  if (!t.shape || t.ndim <= 0) {
+    return false;
+  }
+  if (!t.strides) {
+    return true;
+  }
+  int64_t expected = 1;
+  for (int i = t.ndim - 1; i >= 0; i--) {
+    const int64_t dim = t.shape[i];
+    if (dim <= 0) {
+      return false;
+    }
+    if (t.strides[i] != expected) {
+      return false;
+    }
+    expected *= dim;
+  }
+  return true;
+}
+
+static bool dlpack_numel(const DLTensor& t, uint64_t* out) {
+  if (!t.shape || t.ndim <= 0) {
+    return false;
+  }
+  uint64_t numel = 1;
+  for (int i = 0; i < t.ndim; i++) {
+    const int64_t dim = t.shape[i];
+    if (dim <= 0) {
+      return false;
+    }
+    const uint64_t udim = static_cast<uint64_t>(dim);
+    if (udim != 0 && numel > (UINT64_MAX / udim)) {
+      return false;
+    }
+    numel *= udim;
+  }
+  *out = numel;
+  return true;
+}
+
+static PyObject* dlpack_import(PyObject* /*self*/, PyObject* args) {
+  PyObject* capsule = nullptr;
+  if (!PyArg_ParseTuple(args, "O", &capsule)) {
+    return nullptr;
+  }
+  if (!PyCapsule_CheckExact(capsule)) {
+    PyErr_SetString(PyExc_TypeError, "expected a DLPack capsule (PyCapsule)");
+    return nullptr;
+  }
+
+  const char* cap_name = PyCapsule_GetName(capsule);
+  if (!cap_name || strcmp(cap_name, "dltensor") != 0) {
+    PyErr_SetString(PyExc_ValueError, "expected a DLPack capsule with name 'dltensor'");
+    return nullptr;
+  }
+
+  void* ptr = PyCapsule_GetPointer(capsule, "dltensor");
+  if (!ptr) {
+    return nullptr;
+  }
+  auto* mt = static_cast<DLManagedTensor*>(ptr);
+  const DLTensor& t = mt->dl_tensor;
+
+  if (t.device.device_type != kDLMetal) {
+    PyErr_Format(
+        PyExc_ValueError, "dlpack_import expects kDLMetal device_type=%d", kDLMetal);
+    return nullptr;
+  }
+  if (!dlpack_is_f32(t.dtype)) {
+    PyErr_SetString(PyExc_TypeError, "dlpack_import only supports float32 tensors");
+    return nullptr;
+  }
+  if (!dlpack_is_c_contig(t)) {
+    PyErr_SetString(PyExc_ValueError, "dlpack_import requires a contiguous tensor");
+    return nullptr;
+  }
+
+  uint64_t numel = 0;
+  if (!dlpack_numel(t, &numel)) {
+    PyErr_SetString(PyExc_ValueError, "invalid dlpack shape");
+    return nullptr;
+  }
+  const uint64_t offset = t.byte_offset;
+  if ((offset % 4) != 0) {
+    PyErr_SetString(PyExc_ValueError, "dlpack byte_offset must be multiple of 4");
+    return nullptr;
+  }
+  if (numel > (UINT64_MAX / 4)) {
+    PyErr_SetString(PyExc_OverflowError, "dlpack tensor too large");
+    return nullptr;
+  }
+  const uint64_t nbytes = numel * 4;
+
+  @autoreleasepool {
+    id<MTLBuffer> buf = (__bridge id<MTLBuffer>)t.data;
+    if (!buf) {
+      PyErr_SetString(PyExc_ValueError, "dlpack tensor has null data pointer");
+      return nullptr;
+    }
+    const uint64_t buf_len = static_cast<uint64_t>(buf.length);
+    if (offset > buf_len || (buf_len - offset) < nbytes) {
+      PyErr_SetString(PyExc_ValueError, "dlpack view exceeds MTLBuffer length");
+      return nullptr;
+    }
+
+    int storage_tag = 1;
+    if (buf.storageMode == MTLStorageModeShared) {
+      storage_tag = 0;
+    } else {
+      storage_tag = 1;
+    }
+
+    auto* b = new Buffer();
+    b->buf = t.data;
+    b->nbytes = (Py_ssize_t)nbytes;
+    b->offset = (Py_ssize_t)offset;
+    b->storage = storage_tag;
+    b->dlpack = mt;
+
+    if (PyCapsule_SetName(capsule, "used_dltensor") != 0) {
+      delete b;
+      return nullptr;
+    }
+    if (PyCapsule_SetDestructor(capsule, nullptr) != 0) {
+      delete b;
+      return nullptr;
+    }
+
+    PyObject* buf_capsule = PyCapsule_New(b, kBufferCapsuleName, buffer_capsule_destructor);
+    if (!buf_capsule) {
+      return nullptr;
+    }
+    PyObject* shape_tuple = PyTuple_New(t.ndim);
+    if (!shape_tuple) {
+      Py_DECREF(buf_capsule);
+      return nullptr;
+    }
+    for (int i = 0; i < t.ndim; i++) {
+      PyObject* dim = PyLong_FromLongLong((long long)t.shape[i]);
+      if (!dim) {
+        Py_DECREF(shape_tuple);
+        Py_DECREF(buf_capsule);
+        return nullptr;
+      }
+      PyTuple_SET_ITEM(shape_tuple, i, dim);
+    }
+
+    PyObject* out = PyTuple_New(2);
+    if (!out) {
+      Py_DECREF(shape_tuple);
+      Py_DECREF(buf_capsule);
+      return nullptr;
+    }
+    PyTuple_SET_ITEM(out, 0, buf_capsule);
+    PyTuple_SET_ITEM(out, 1, shape_tuple);
+    return out;
+  }
+}
+
+struct DlpackExportCtx {
+  PyObject* buf_capsule;
+  int64_t* shape;
+  int ndim;
+};
+
+static void dlpack_export_deleter(DLManagedTensor* self) {
+  if (!self) {
+    return;
+  }
+  auto* ctx = static_cast<DlpackExportCtx*>(self->manager_ctx);
+  if (ctx) {
+    if (ctx->shape) {
+      free(ctx->shape);
+      ctx->shape = nullptr;
+    }
+    if (ctx->buf_capsule) {
+      PyGILState_STATE st = PyGILState_Ensure();
+      Py_DECREF(ctx->buf_capsule);
+      PyGILState_Release(st);
+      ctx->buf_capsule = nullptr;
+    }
+    delete ctx;
+  }
+  delete self;
+}
+
+static void dlpack_capsule_destructor(PyObject* capsule) {
+  void* ptr = PyCapsule_GetPointer(capsule, "dltensor");
+  if (!ptr) {
+    PyErr_Clear();
+    return;
+  }
+  auto* mt = static_cast<DLManagedTensor*>(ptr);
+  if (mt->deleter) {
+    mt->deleter(mt);
+  }
+}
+
+static bool queue_synchronize_impl() {
+  @autoreleasepool {
+    id<MTLCommandQueue> queue = get_queue();
+    if (!queue) {
+      PyErr_SetString(PyExc_RuntimeError, "Metal command queue unavailable");
+      return false;
+    }
+    id<MTLCommandBuffer> cb = [queue commandBuffer];
+    if (!cb) {
+      PyErr_SetString(PyExc_RuntimeError, "failed to create MTLCommandBuffer");
+      return false;
+    }
+    [cb commit];
+    [cb waitUntilCompleted];
+    if (cb.status == MTLCommandBufferStatusError) {
+      NSError* err = cb.error;
+      const char* msg = err ? [[err localizedDescription] UTF8String] : "unknown error";
+      PyErr_Format(PyExc_RuntimeError, "Metal command buffer failed: %s", msg);
+      return false;
+    }
+    return true;
+  }
+}
+
+static PyObject* queue_synchronize(PyObject* /*self*/, PyObject* /*args*/) {
+  if (!queue_synchronize_impl()) {
+    return nullptr;
+  }
+  Py_RETURN_NONE;
+}
+
+static PyObject* dlpack_export(PyObject* /*self*/, PyObject* args) {
+  PyObject* capsule = nullptr;
+  PyObject* shape_obj = nullptr;
+  if (!PyArg_ParseTuple(args, "OO", &capsule, &shape_obj)) {
+    return nullptr;
+  }
+  void* ptr = PyCapsule_GetPointer(capsule, kBufferCapsuleName);
+  if (!ptr) {
+    return nullptr;
+  }
+  auto* b = static_cast<Buffer*>(ptr);
+
+  PyObject* shape = PySequence_Fast(shape_obj, "shape must be a sequence of ints");
+  if (!shape) {
+    return nullptr;
+  }
+  const Py_ssize_t ndim = PySequence_Fast_GET_SIZE(shape);
+  if (ndim <= 0) {
+    Py_DECREF(shape);
+    PyErr_SetString(PyExc_ValueError, "shape must be non-empty");
+    return nullptr;
+  }
+
+  uint64_t numel = 1;
+  int64_t* shape_arr = static_cast<int64_t*>(calloc((size_t)ndim, sizeof(int64_t)));
+  if (!shape_arr) {
+    Py_DECREF(shape);
+    PyErr_NoMemory();
+    return nullptr;
+  }
+  bool ok = true;
+  for (Py_ssize_t i = 0; i < ndim; i++) {
+    PyObject* item = PySequence_Fast_GET_ITEM(shape, i);
+    long long dim_ll = PyLong_AsLongLong(item);
+    if (dim_ll <= 0 || PyErr_Occurred()) {
+      ok = false;
+      break;
+    }
+    shape_arr[i] = (int64_t)dim_ll;
+    const uint64_t udim = static_cast<uint64_t>(dim_ll);
+    if (udim != 0 && numel > (UINT64_MAX / udim)) {
+      ok = false;
+      PyErr_SetString(PyExc_OverflowError, "tensor too large");
+      break;
+    }
+    numel *= udim;
+  }
+  Py_DECREF(shape);
+  if (!ok) {
+    free(shape_arr);
+    if (!PyErr_Occurred()) {
+      PyErr_SetString(PyExc_ValueError, "invalid shape");
+    }
+    return nullptr;
+  }
+  if (numel > (UINT64_MAX / 4)) {
+    free(shape_arr);
+    PyErr_SetString(PyExc_OverflowError, "tensor too large");
+    return nullptr;
+  }
+  const uint64_t nbytes = numel * 4;
+  if (nbytes > static_cast<uint64_t>(b->nbytes)) {
+    free(shape_arr);
+    PyErr_SetString(PyExc_ValueError, "shape exceeds buffer view size");
+    return nullptr;
+  }
+
+  if (!queue_synchronize_impl()) {
+    free(shape_arr);
+    return nullptr;
+  }
+
+  auto* mt = new DLManagedTensor();
+  memset(mt, 0, sizeof(*mt));
+  mt->dl_tensor.data = b->buf;
+  mt->dl_tensor.device.device_type = kDLMetal;
+  mt->dl_tensor.device.device_id = 0;
+  mt->dl_tensor.ndim = (int)ndim;
+  mt->dl_tensor.dtype.code = kDLFloat;
+  mt->dl_tensor.dtype.bits = 32;
+  mt->dl_tensor.dtype.lanes = 1;
+  mt->dl_tensor.shape = shape_arr;
+  mt->dl_tensor.strides = nullptr;
+  mt->dl_tensor.byte_offset = (uint64_t)b->offset;
+
+  auto* ctx = new DlpackExportCtx();
+  ctx->shape = shape_arr;
+  ctx->ndim = (int)ndim;
+  Py_INCREF(capsule);
+  ctx->buf_capsule = capsule;
+  mt->manager_ctx = ctx;
+  mt->deleter = dlpack_export_deleter;
+
+  PyObject* out = PyCapsule_New(mt, "dltensor", dlpack_capsule_destructor);
+  if (!out) {
+    // ctx->shape is owned by mt and will be freed by deleter if we call it.
+    mt->deleter(mt);
+    return nullptr;
+  }
+  return out;
 }
 
 static PyObject* launch_async(PyObject* /*self*/, PyObject* args) {
@@ -525,7 +929,7 @@ static PyObject* launch_async(PyObject* /*self*/, PyObject* args) {
             ok = false;
             break;
           }
-          [enc setBuffer:buf offset:0 atIndex:(NSUInteger)i];
+          [enc setBuffer:buf offset:(NSUInteger)b->offset atIndex:(NSUInteger)i];
           Py_INCREF(obj);
           keepalive[i] = obj;
           continue;
@@ -777,7 +1181,7 @@ static PyObject* launch(PyObject* /*self*/, PyObject* args) {
             ok = false;
             break;
           }
-          [enc setBuffer:buf offset:0 atIndex:(NSUInteger)i];
+          [enc setBuffer:buf offset:(NSUInteger)b->offset atIndex:(NSUInteger)i];
           continue;
         }
         if (PyErr_Occurred()) {
@@ -861,6 +1265,9 @@ static PyMethodDef Methods[] = {
     {"alloc_buffer", alloc_buffer, METH_VARARGS, nullptr},
     {"copy_from_host", copy_from_host, METH_VARARGS, nullptr},
     {"copy_to_host", copy_to_host, METH_VARARGS, nullptr},
+    {"dlpack_import", dlpack_import, METH_VARARGS, nullptr},
+    {"dlpack_export", dlpack_export, METH_VARARGS, nullptr},
+    {"queue_synchronize", queue_synchronize, METH_NOARGS, nullptr},
     {"launch", launch, METH_VARARGS, nullptr},
     {"launch_async", launch_async, METH_VARARGS, nullptr},
     {"synchronize", synchronize, METH_VARARGS, nullptr},

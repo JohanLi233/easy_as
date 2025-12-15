@@ -17,7 +17,17 @@ def load_metal_ext(*, require: bool) -> Any | None:
 
     mod = importlib.import_module("eas._metal")
     missing: list[str] = []
-    for name in ("is_available", "compile", "launch", "alloc_buffer", "copy_from_host", "copy_to_host"):
+    for name in (
+        "is_available",
+        "compile",
+        "launch",
+        "alloc_buffer",
+        "copy_from_host",
+        "copy_to_host",
+        "dlpack_import",
+        "dlpack_export",
+        "queue_synchronize",
+    ):
         if not callable(getattr(mod, name, None)):
             missing.append(name)
     if missing:

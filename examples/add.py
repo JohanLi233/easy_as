@@ -4,14 +4,13 @@ import argparse
 import os
 import time
 
-import numpy as np
-
 import eas
 from eas import mk
 from eas.runtime import get_runtime
 
 try:
     import torch
+
     TORCH_AVAILABLE = True
     TORCH_MPS_AVAILABLE = torch.backends.mps.is_available()
 except ImportError:
@@ -31,12 +30,19 @@ def add_kernel(a, b, c, N, BLOCK: eas.constexpr):
 
 
 def main(argv: list[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(description="easy_as elementwise add demo")
-    parser.add_argument("--n", type=int, default=1024 + 7, help="number of elements")
-    parser.add_argument("--block", type=int, default=256, help="BLOCK size (threadgroup size)")
-    parser.add_argument("--iters", type=int, default=1, help="number of timed iterations")
-    parser.add_argument("--print-msl", action="store_true", help="print generated MSL")
+    parser = argparse.ArgumentParser(description="easy_as 元素级加法演示")
+    parser.add_argument("--n", type=int, default=1024 + 7, help="元素数量")
+    parser.add_argument(
+        "--block", type=int, default=256, help="BLOCK 大小（线程组大小）"
+    )
+    parser.add_argument("--iters", type=int, default=1, help="计时的迭代次数")
+    parser.add_argument("--print-msl", action="store_true", help="打印生成的 MSL")
     args = parser.parse_args(argv)
+
+    if not TORCH_AVAILABLE:
+        raise SystemExit(
+            "torch is not installed; please install torch to run this example"
+        )
 
     backend_env = os.environ.get("EAS_BACKEND", "auto")
     runtime = get_runtime()
@@ -49,81 +55,61 @@ def main(argv: list[str] | None = None) -> None:
     if n <= 0 or block <= 0 or iters <= 0:
         raise SystemExit("--n/--block/--iters must be > 0")
 
-    a = np.random.randn(n).astype(np.float32)
-    b = np.random.randn(n).astype(np.float32)
-    c = np.zeros_like(a)
+    device = (
+        torch.device("mps")
+        if (runtime_name == "MetalRuntime" and TORCH_MPS_AVAILABLE)
+        else torch.device("cpu")
+    )
+    a = torch.randn(n, dtype=torch.float32, device=device)
+    b = torch.randn(n, dtype=torch.float32, device=device)
+    c = torch.empty_like(a)
 
-    # correctness (includes first-time compile)
-    if runtime_name == "MetalRuntime":
-        a_e = eas.tensor(a, device="metal")
-        b_e = eas.tensor(b, device="metal")
-        c_e = eas.empty_like(a_e)
-        add_kernel(a_e, b_e, c_e, n, BLOCK=block)
-        np.testing.assert_allclose(c_e.numpy(), a + b)
+    # 正确性验证（包括首次编译）
+    add_kernel(a, b, c, n, BLOCK=block)
+    if device.type == "mps":
+        torch.mps.synchronize()
+    expected = a + b
+    if hasattr(torch.testing, "assert_close"):
+        torch.testing.assert_close(c, expected, rtol=1e-5, atol=1e-6)
     else:
-        add_kernel(a, b, c, n, BLOCK=block)
-        np.testing.assert_allclose(c, a + b)
-    print("OK (correctness)")
+        if not torch.allclose(c, expected, rtol=1e-5, atol=1e-6):
+            raise AssertionError("torch.allclose failed")
+    print(f"OK（正确性验证，设备={device}）")
 
-    # test with torch tensors if available
-    if TORCH_AVAILABLE:
-        # Determine device
-        device = torch.device('mps') if TORCH_MPS_AVAILABLE else torch.device('cpu')
-        a_torch = torch.randn(n, dtype=torch.float32, device=device)
-        b_torch = torch.randn(n, dtype=torch.float32, device=device)
-        c_torch = torch.empty_like(a_torch)
-        # Move to CPU for numpy conversion
-        a_np = a_torch.cpu().numpy()
-        b_np = b_torch.cpu().numpy()
-        c_np = np.zeros_like(a_np)
-
-        if runtime_name == "MetalRuntime":
-            a_e = eas.tensor(a_np, device="metal")
-            b_e = eas.tensor(b_np, device="metal")
-            c_e = eas.empty_like(a_e)
-            add_kernel(a_e, b_e, c_e, n, BLOCK=block)
-            np.testing.assert_allclose(c_e.numpy(), a_np + b_np)
-        else:
-            add_kernel(a_np, b_np, c_np, n, BLOCK=block)
-            np.testing.assert_allclose(c_np, a_np + b_np)
-        torch.add(a_torch, b_torch, out=c_torch)
-        # Move result to CPU for comparison
-        np.testing.assert_allclose(c_torch.cpu().numpy(), a_np + b_np)
-        print(f"OK (correctness with torch tensors, device={device})")
-
-    # quick timing (best-effort; includes launch overhead)
+    # 快速计时（尽力而为；包括启动开销）
     if hasattr(runtime, "synchronize"):
         runtime.synchronize()
+    if device.type == "mps":
+        torch.mps.synchronize()
     t0 = time.perf_counter()
     for _ in range(iters):
-        if runtime_name == "MetalRuntime":
-            add_kernel(a_e, b_e, c_e, n, BLOCK=block, _sync=False)
-        else:
-            add_kernel(a, b, c, n, BLOCK=block, _sync=False)
+        add_kernel(a, b, c, n, BLOCK=block, _sync=False)
     if hasattr(runtime, "synchronize"):
         runtime.synchronize()
+    if device.type == "mps":
+        torch.mps.synchronize()
     t1 = time.perf_counter()
     eas_ms = (t1 - t0) * 1e3 / iters
     print(f"time: {eas_ms:.3f} ms/iter (iters={iters})")
 
-    if TORCH_AVAILABLE:
-        # torch timing (CPU or MPS; best-effort)
-        warmup = min(20, iters)
-        for _ in range(warmup):
-            torch.add(a_torch, b_torch, out=c_torch)
-        if TORCH_MPS_AVAILABLE:
-            torch.mps.synchronize()
-        t0 = time.perf_counter()
-        for _ in range(iters):
-            torch.add(a_torch, b_torch, out=c_torch)
-        if TORCH_MPS_AVAILABLE:
-            torch.mps.synchronize()
-        t1 = time.perf_counter()
-        torch_ms = (t1 - t0) * 1e3 / iters
-        ratio = eas_ms / torch_ms if torch_ms > 0 else float("inf")
-        device_str = "mps" if TORCH_MPS_AVAILABLE else "cpu"
-        print(f"torch ({device_str}): {torch_ms:.3f} ms/iter (iters={iters}, warmup={warmup})")
-        print(f"ratio eas/torch: {ratio:.2f}x")
+    # torch 计时（CPU 或 MPS；尽力而为）
+    warmup = min(20, iters)
+    for _ in range(warmup):
+        torch.add(a, b, out=c)
+    if device.type == "mps":
+        torch.mps.synchronize()
+    t0 = time.perf_counter()
+    for _ in range(iters):
+        torch.add(a, b, out=c)
+    if device.type == "mps":
+        torch.mps.synchronize()
+    t1 = time.perf_counter()
+    torch_ms = (t1 - t0) * 1e3 / iters
+    ratio = eas_ms / torch_ms if torch_ms > 0 else float("inf")
+    print(
+        f"torch ({device.type}): {torch_ms:.3f} ms/iter (iters={iters}, warmup={warmup})"
+    )
+    print(f"ratio eas/torch: {ratio:.2f}x")
 
     if args.print_msl:
         print(add_kernel.to_msl(a, b, c, n, BLOCK=block))

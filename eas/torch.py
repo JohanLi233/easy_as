@@ -21,4 +21,3 @@ def from_torch(x: Any, *, device: str | None = None) -> Tensor:
 
 def to_torch(x: Tensor, *, device: str | None = None) -> Any:
     return x.to_torch(device=device)
-

@@ -11,8 +11,10 @@ import numpy as np
 from ..ir import DType, IRModule
 from .metal_ext import load_metal_ext
 
+
 def _is_tensor(v: Any) -> bool:
     return bool(getattr(v, "__eas_tensor__", False))
+
 
 def _pack_scalar(dtype: DType, value: Any) -> bytes:
     if dtype == DType.U32:
@@ -99,6 +101,35 @@ class MetalRuntime:
 
         argv: list[object] = []
         writable: list[bool] = []
+        torch_mps_sync_needed = False
+        torch_mod: Any | None = None
+        if os.environ.get("EAS_TORCH_MPS_SYNC", "1").strip().lower() not in (
+            "0",
+            "false",
+            "no",
+            "off",
+        ):
+            try:
+                import torch  # type: ignore
+
+                torch_mod = torch
+            except ImportError:
+                torch_mod = None
+
+        if torch_mod is not None:
+            for arg in ir.args:
+                if arg.kind != "buffer":
+                    continue
+                v = runtime_args[arg.name]
+                if isinstance(v, torch_mod.Tensor) and v.device.type == "mps":
+                    torch_mps_sync_needed = True
+                    break
+
+        if torch_mps_sync_needed:
+            # Enterprise-safe default: ensure all prior torch(mps) work is visible
+            # before consuming MPS tensors on our Metal command queue.
+            torch_mod.mps.synchronize()
+
         for arg in ir.args:
             v = runtime_args[arg.name]
             if arg.kind == "buffer":
@@ -106,11 +137,26 @@ class MetalRuntime:
                     import torch  # type: ignore
 
                     if isinstance(v, torch.Tensor):
-                        raise TypeError(
-                            f"MetalRuntime expects eas.Tensor(device='metal') for {arg.name!r}; "
-                            "convert with eas.tensor(torch_tensor, device='metal')"
-                        )
-                except Exception:
+                        t = v.detach() if getattr(v, "requires_grad", False) else v
+                        if t.dtype != torch.float32:
+                            raise TypeError(
+                                f"{arg.name!r} must be float32, got {t.dtype}"
+                            )
+                        if t.device.type == "mps":
+                            if not t.is_contiguous():
+                                t = t.contiguous()
+                            cap = t.__dlpack__()
+                            buf, _shape = self._mod().dlpack_import(cap)
+                            argv.append(buf)
+                            writable.append(arg.name in writes)
+                            continue
+                        if t.device.type == "cpu":
+                            v = t.contiguous().numpy()
+                        else:
+                            raise TypeError(
+                                f"unsupported torch device for {arg.name!r}: {t.device!s}"
+                            )
+                except ImportError:
                     pass
                 if _is_tensor(v):
                     if getattr(v, "device", None) == "metal":

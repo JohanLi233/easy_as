@@ -54,3 +54,34 @@ class TestTorchInterop(unittest.TestCase):
             else:
                 os.environ["EAS_BACKEND"] = old
 
+    def test_mps_zero_copy_via_dlpack(self) -> None:
+        import torch  # type: ignore
+
+        if not torch.backends.mps.is_available():
+            self.skipTest("torch mps is not available")
+
+        from eas.runtime import get_runtime
+
+        rt = get_runtime("metal")
+        if not rt.is_available():
+            self.skipTest("Metal runtime is not available")
+
+        old = os.environ.get("EAS_BACKEND")
+        os.environ["EAS_BACKEND"] = "metal"
+        try:
+            n = 4096 + 3
+            a = torch.randn(n, device="mps", dtype=torch.float32)
+            b = torch.randn(n, device="mps", dtype=torch.float32)
+            c = torch.empty_like(a)
+
+            add_kernel(a, b, c, n, BLOCK=256)
+            torch.mps.synchronize()
+
+            np.testing.assert_allclose(
+                c.cpu().numpy(), (a + b).cpu().numpy(), rtol=1e-5, atol=1e-6
+            )
+        finally:
+            if old is None:
+                os.environ.pop("EAS_BACKEND", None)
+            else:
+                os.environ["EAS_BACKEND"] = old

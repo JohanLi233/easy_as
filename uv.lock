@@ -31,6 +31,9 @@ dev = [
     { name = "pytest" },
     { name = "torch" },
 ]
+torch = [
+    { name = "torch" },
+]
 
 [package.metadata]
 requires-dist = [
@@ -38,8 +41,9 @@ requires-dist = [
     { name = "pyobjc", specifier = ">=12.1" },
     { name = "pytest", marker = "extra == 'dev'" },
     { name = "torch", marker = "extra == 'dev'" },
+    { name = "torch", marker = "extra == 'torch'" },
 ]
-provides-extras = ["dev"]
+provides-extras = ["torch", "dev"]
 
 [[package]]
 name = "exceptiongroup"

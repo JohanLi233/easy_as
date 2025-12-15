@@ -18,4 +18,3 @@ def infer_writes(ir: IRModule) -> frozenset[str]:
             if name is not None:
                 writes.add(name)
     return frozenset(writes)
-
