@@ -1,0 +1,20 @@
+[project]
+name = "easy-as"
+version = "0.0.1"
+description = "Python-first DSL for writing and running Metal kernels (MVP)."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=2.0",
+    "pyobjc>=12.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "torch",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
