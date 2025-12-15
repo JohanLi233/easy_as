@@ -13,8 +13,10 @@ from eas.runtime import get_runtime
 try:
     import torch
     TORCH_AVAILABLE = True
+    TORCH_MPS_AVAILABLE = torch.backends.mps.is_available()
 except ImportError:
     TORCH_AVAILABLE = False
+    TORCH_MPS_AVAILABLE = False
 
 
 @eas.kernel
@@ -58,39 +60,52 @@ def main(argv: list[str] | None = None) -> None:
 
     # test with torch tensors if available
     if TORCH_AVAILABLE:
-        a_torch = torch.randn(n, dtype=torch.float32)
-        b_torch = torch.randn(n, dtype=torch.float32)
+        # Determine device
+        device = torch.device('mps') if TORCH_MPS_AVAILABLE else torch.device('cpu')
+        a_torch = torch.randn(n, dtype=torch.float32, device=device)
+        b_torch = torch.randn(n, dtype=torch.float32, device=device)
         c_torch = torch.empty_like(a_torch)
-        a_np = a_torch.numpy()
-        b_np = b_torch.numpy()
+        # Move to CPU for numpy conversion
+        a_np = a_torch.cpu().numpy()
+        b_np = b_torch.cpu().numpy()
         c_np = np.zeros_like(a_np)
 
         add_kernel(a_np, b_np, c_np, n, BLOCK=block)
         np.testing.assert_allclose(c_np, a_np + b_np)
         torch.add(a_torch, b_torch, out=c_torch)
-        np.testing.assert_allclose(c_torch.numpy(), a_np + b_np)
-        print("OK (correctness with torch tensors)")
+        # Move result to CPU for comparison
+        np.testing.assert_allclose(c_torch.cpu().numpy(), a_np + b_np)
+        print(f"OK (correctness with torch tensors, device={device})")
 
     # quick timing (best-effort; includes launch overhead)
+    if hasattr(runtime, "synchronize"):
+        runtime.synchronize()
     t0 = time.perf_counter()
     for _ in range(iters):
-        add_kernel(a, b, c, n, BLOCK=block)
+        add_kernel(a, b, c, n, BLOCK=block, _sync=False)
+    if hasattr(runtime, "synchronize"):
+        runtime.synchronize()
     t1 = time.perf_counter()
     eas_ms = (t1 - t0) * 1e3 / iters
     print(f"time: {eas_ms:.3f} ms/iter (iters={iters})")
 
     if TORCH_AVAILABLE:
-        # torch timing (CPU; best-effort)
+        # torch timing (CPU or MPS; best-effort)
         warmup = min(20, iters)
         for _ in range(warmup):
             torch.add(a_torch, b_torch, out=c_torch)
+        if TORCH_MPS_AVAILABLE:
+            torch.mps.synchronize()
         t0 = time.perf_counter()
         for _ in range(iters):
             torch.add(a_torch, b_torch, out=c_torch)
+        if TORCH_MPS_AVAILABLE:
+            torch.mps.synchronize()
         t1 = time.perf_counter()
         torch_ms = (t1 - t0) * 1e3 / iters
         ratio = eas_ms / torch_ms if torch_ms > 0 else float("inf")
-        print(f"torch: {torch_ms:.3f} ms/iter (iters={iters}, warmup={warmup})")
+        device_str = "mps" if TORCH_MPS_AVAILABLE else "cpu"
+        print(f"torch ({device_str}): {torch_ms:.3f} ms/iter (iters={iters}, warmup={warmup})")
         print(f"ratio eas/torch: {ratio:.2f}x")
 
     if args.print_msl:

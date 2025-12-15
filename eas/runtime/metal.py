@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import struct
+import os
+from collections import deque
 from dataclasses import dataclass
 from typing import Any, Mapping
 
@@ -24,6 +26,25 @@ class MetalRuntime:
     _metal: Any | None = None
     _pipeline_cache: dict[tuple[str, str], Any] | None = None
     _available: bool | None = None
+    _pending: deque[Any] | None = None
+    _max_in_flight: int | None = None
+
+    def _get_max_in_flight(self) -> int:
+        v = self._max_in_flight
+        if v is not None:
+            return v
+        env = os.environ.get("EAS_MAX_IN_FLIGHT", "").strip()
+        if env:
+            try:
+                v = int(env)
+            except ValueError:
+                v = 256
+        else:
+            v = 256
+        if v < 0:
+            v = 0
+        self._max_in_flight = v
+        return v
 
     def is_available(self) -> bool:
         if self._available is not None:
@@ -56,7 +77,12 @@ class MetalRuntime:
         return pipeline
 
     def run(
-        self, ck: Any, runtime_args: Mapping[str, Any], meta: Mapping[str, Any]
+        self,
+        ck: Any,
+        runtime_args: Mapping[str, Any],
+        meta: Mapping[str, Any],
+        *,
+        sync: bool = True,
     ) -> None:
         _ = meta
         ir: IRModule = ck.ir
@@ -88,4 +114,25 @@ class MetalRuntime:
                 writable.append(False)
 
         pipeline = self._get_pipeline(ck)
-        self._mod().launch(pipeline, argv, writable, int(grid), int(threadgroup_size))
+        mod = self._mod()
+        if sync or not callable(getattr(mod, "launch_async", None)):
+            mod.launch(pipeline, argv, writable, int(grid), int(threadgroup_size))
+            return
+
+        pending = mod.launch_async(
+            pipeline, argv, writable, int(grid), int(threadgroup_size)
+        )
+        if self._pending is None:
+            self._pending = deque()
+        self._pending.append(pending)
+        max_in_flight = self._get_max_in_flight()
+        if max_in_flight and len(self._pending) > max_in_flight:
+            mod.synchronize(self._pending.popleft())
+
+    def synchronize(self) -> None:
+        pending = self._pending
+        if not pending:
+            return
+        mod = self._mod()
+        while pending:
+            mod.synchronize(pending.popleft())

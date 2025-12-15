@@ -12,6 +12,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "torch",
+    "pytest",
 ]
 
 [build-system]

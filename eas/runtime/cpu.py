@@ -21,8 +21,15 @@ def _zero(dtype: DType) -> Any:
 @dataclass(slots=True)
 class CpuRuntime:
     def run(
-        self, ck: Any, runtime_args: Mapping[str, Any], meta: Mapping[str, Any]
+        self,
+        ck: Any,
+        runtime_args: Mapping[str, Any],
+        meta: Mapping[str, Any],
+        *,
+        sync: bool = True,
     ) -> None:
+        _ = meta
+        _ = sync
         ir: IRModule = ck.ir
         threadgroup_size: int = ck.threadgroup_size
 

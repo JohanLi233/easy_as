@@ -24,7 +24,14 @@ class Kernel:
             CompiledKernel,
         ] = {}
 
+    def _pop_runtime_options(self, kwargs: dict[str, Any]) -> dict[str, Any]:
+        sync = kwargs.pop("_sync", True)
+        if not isinstance(sync, bool):
+            raise TypeError(f"_sync must be bool, got {type(sync)!r}")
+        return {"sync": sync}
+
     def compile(self, /, *args: Any, **kwargs: Any) -> CompiledKernel:
+        _ = self._pop_runtime_options(kwargs)
         bound = self.sig.bind(*args, **kwargs)
         bound.apply_defaults()
 
@@ -48,6 +55,7 @@ class Kernel:
         return ck
 
     def __call__(self, /, *args: Any, **kwargs: Any) -> None:
+        runtime_opts = self._pop_runtime_options(kwargs)
         ck = self.compile(*args, **kwargs)
         bound = self.sig.bind(*args, **kwargs)
         bound.apply_defaults()
@@ -57,9 +65,10 @@ class Kernel:
             if k in self.meta_params
         }
         runtime_args = bound.arguments
-        get_runtime().run(ck, runtime_args, meta)
+        get_runtime().run(ck, runtime_args, meta, **runtime_opts)
 
     def to_msl(self, /, *args: Any, **kwargs: Any) -> str:
+        _ = self._pop_runtime_options(kwargs)
         return self.compile(*args, **kwargs).msl
 
 

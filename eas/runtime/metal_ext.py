@@ -27,4 +27,3 @@ def load_metal_ext(*, require: bool) -> Any | None:
             + ". Rebuild it with `python3 tools/build_metal_ext.py`."
         )
     return mod
-
