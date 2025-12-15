@@ -94,15 +94,24 @@ def ir_to_msl(ir: IRModule) -> tuple[str, int]:
                     _add_use(a, i)
 
         def _deps(value_id: int, out: set[int]) -> None:
-            if value_id in out:
-                return
-            out.add(value_id)
-            inst = def_by_id.get(value_id)
-            if inst is None or inst.op == "arg":
-                return
-            for a in inst.args:
-                if isinstance(a, ValueRef):
-                    _deps(a.id, out)
+            """
+            Collect transitive ValueRef dependencies for a given value id.
+
+            Use an explicit stack (not recursion) so large unrolled kernels
+            (e.g. big constexpr loops) don't hit Python recursion limits.
+            """
+            stack: list[int] = [value_id]
+            while stack:
+                vid = stack.pop()
+                if vid in out:
+                    continue
+                out.add(vid)
+                inst = def_by_id.get(vid)
+                if inst is None or inst.op == "arg":
+                    continue
+                for a in inst.args:
+                    if isinstance(a, ValueRef) and a.id not in out:
+                        stack.append(a.id)
 
         moved: set[int] = set()
         lifted: dict[int, list[int]] = {}
