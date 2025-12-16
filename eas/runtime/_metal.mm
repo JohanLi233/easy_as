@@ -123,7 +123,9 @@ static void pending_capsule_destructor(PyObject* capsule) {
   @autoreleasepool {
     if (p->cb) {
       id<MTLCommandBuffer> cb = (__bridge id<MTLCommandBuffer>)p->cb;
+      Py_BEGIN_ALLOW_THREADS
       [cb waitUntilCompleted];
+      Py_END_ALLOW_THREADS
       CFRelease(p->cb);
       p->cb = nullptr;
     }
@@ -315,13 +317,6 @@ static bool copy_from_host_impl(Buffer* b, Py_buffer* src_view) {
       PyErr_SetString(PyExc_RuntimeError, "Metal device/queue unavailable");
       return false;
     }
-    id<MTLBuffer> staging = [device newBufferWithBytes:src_view->buf
-                                                length:(NSUInteger)src_view->len
-                                               options:MTLResourceStorageModeShared];
-    if (!staging) {
-      PyErr_SetString(PyExc_RuntimeError, "failed to allocate staging buffer");
-      return false;
-    }
     id<MTLCommandBuffer> cb = [queue commandBuffer];
     if (!cb) {
       PyErr_SetString(PyExc_RuntimeError, "failed to create MTLCommandBuffer");
@@ -332,6 +327,15 @@ static bool copy_from_host_impl(Buffer* b, Py_buffer* src_view) {
       PyErr_SetString(PyExc_RuntimeError, "failed to create MTLBlitCommandEncoder");
       return false;
     }
+    // Wrap the source pointer directly to avoid an extra host memcpy into a staging buffer.
+    id<MTLBuffer> staging = [device newBufferWithBytesNoCopy:src_view->buf
+                                                     length:(NSUInteger)src_view->len
+                                                    options:MTLResourceStorageModeShared
+                                                deallocator:nil];
+    if (!staging) {
+      PyErr_SetString(PyExc_RuntimeError, "failed to create staging MTLBuffer");
+      return false;
+    }
     [blit copyFromBuffer:staging
             sourceOffset:0
                 toBuffer:dst
@@ -339,7 +343,9 @@ static bool copy_from_host_impl(Buffer* b, Py_buffer* src_view) {
                     size:(NSUInteger)src_view->len];
     [blit endEncoding];
     [cb commit];
+    Py_BEGIN_ALLOW_THREADS
     [cb waitUntilCompleted];
+    Py_END_ALLOW_THREADS
     if (cb.status == MTLCommandBufferStatusError) {
       NSError* err = cb.error;
       const char* msg = err ? [[err localizedDescription] UTF8String] : "unknown error";
@@ -376,9 +382,13 @@ static bool copy_to_host_impl(Buffer* b, Py_buffer* dst_view) {
       PyErr_SetString(PyExc_RuntimeError, "Metal device/queue unavailable");
       return false;
     }
-    id<MTLBuffer> staging = [device newBufferWithLength:(NSUInteger)b->nbytes options:MTLResourceStorageModeShared];
-    if (!staging) {
-      PyErr_SetString(PyExc_RuntimeError, "failed to allocate staging buffer");
+    // Wrap the destination pointer directly to avoid allocating a staging buffer and memcpy.
+    id<MTLBuffer> dst = [device newBufferWithBytesNoCopy:dst_view->buf
+                                                 length:(NSUInteger)b->nbytes
+                                                options:MTLResourceStorageModeShared
+                                            deallocator:nil];
+    if (!dst) {
+      PyErr_SetString(PyExc_RuntimeError, "failed to create destination MTLBuffer");
       return false;
     }
     id<MTLCommandBuffer> cb = [queue commandBuffer];
@@ -393,19 +403,20 @@ static bool copy_to_host_impl(Buffer* b, Py_buffer* dst_view) {
     }
     [blit copyFromBuffer:src
             sourceOffset:(NSUInteger)b->offset
-                toBuffer:staging
+                toBuffer:dst
        destinationOffset:0
                     size:(NSUInteger)b->nbytes];
     [blit endEncoding];
     [cb commit];
+    Py_BEGIN_ALLOW_THREADS
     [cb waitUntilCompleted];
+    Py_END_ALLOW_THREADS
     if (cb.status == MTLCommandBufferStatusError) {
       NSError* err = cb.error;
       const char* msg = err ? [[err localizedDescription] UTF8String] : "unknown error";
       PyErr_Format(PyExc_RuntimeError, "Metal blit failed: %s", msg);
       return false;
     }
-    memcpy(dst_view->buf, staging.contents, (size_t)b->nbytes);
     return true;
   }
 }
@@ -672,7 +683,9 @@ static bool queue_synchronize_impl() {
       return false;
     }
     [cb commit];
+    Py_BEGIN_ALLOW_THREADS
     [cb waitUntilCompleted];
+    Py_END_ALLOW_THREADS
     if (cb.status == MTLCommandBufferStatusError) {
       NSError* err = cb.error;
       const char* msg = err ? [[err localizedDescription] UTF8String] : "unknown error";
@@ -1014,7 +1027,9 @@ static PyObject* synchronize(PyObject* /*self*/, PyObject* args) {
 
   @autoreleasepool {
     id<MTLCommandBuffer> cb = (__bridge id<MTLCommandBuffer>)p->cb;
+    Py_BEGIN_ALLOW_THREADS
     [cb waitUntilCompleted];
+    Py_END_ALLOW_THREADS
     bool ok = (cb.status != MTLCommandBufferStatusError);
     NSError* err = cb.error;
 
@@ -1232,7 +1247,9 @@ static PyObject* launch(PyObject* /*self*/, PyObject* args) {
     [enc endEncoding];
 
     [cb commit];
+    Py_BEGIN_ALLOW_THREADS
     [cb waitUntilCompleted];
+    Py_END_ALLOW_THREADS
 
     if (cb.status == MTLCommandBufferStatusError) {
       NSError* err = cb.error;
