@@ -12,7 +12,7 @@ import numpy as np
 
 from ..ir import DType, IRModule
 from .metal_ext import load_metal_ext
-from .grid import infer_nthreads
+from .grid import infer_grid, infer_nthreads
 
 
 def _is_tensor(v: Any) -> bool:
@@ -221,17 +221,26 @@ class MetalRuntime:
         sync: bool = True,
         nthreads: int | None = None,
         grid: tuple[int, int, int] | None = None,
+        shape: tuple[int, ...] | None = None,
     ) -> None:
         _ = meta
         ir: IRModule = ck.ir
         threadgroup_size: int = ck.threadgroup_size
 
         if grid is None:
-            n = infer_nthreads(runtime_args, nthreads=nthreads)
-            if n == 0:
-                return
-            tpg: int | tuple[int, int, int] = int(n)
-            tptg: int | tuple[int, int, int] = int(threadgroup_size)
+            inferred = infer_grid(ir, runtime_args, threadgroup_size, shape=shape)
+            if inferred is None:
+                n = infer_nthreads(runtime_args, nthreads=nthreads)
+                if n == 0:
+                    return
+                tpg: int | tuple[int, int, int] = int(n)
+                tptg: int | tuple[int, int, int] = int(threadgroup_size)
+            else:
+                gx, gy, gz = inferred
+                if gx == 0 or gy == 0 or gz == 0:
+                    return
+                tpg = (gx * int(threadgroup_size), gy, gz)
+                tptg = (int(threadgroup_size), 1, 1)
         else:
             gx, gy, gz = map(int, grid)
             if gx < 0 or gy < 0 or gz < 0:
@@ -286,6 +295,7 @@ class MetalRuntime:
         torch_mps_sync: bool = False,
         nthreads: int | None = None,
         grid: tuple[int, int, int] | None = None,
+        shape: tuple[int, ...] | None = None,
     ) -> float:
         _ = meta
         if repeat <= 0:
@@ -299,11 +309,19 @@ class MetalRuntime:
         threadgroup_size: int = ck.threadgroup_size
 
         if grid is None:
-            n = infer_nthreads(runtime_args, nthreads=nthreads)
-            if n == 0:
-                return 0.0
-            tpg: int | tuple[int, int, int] = int(n)
-            tptg: int | tuple[int, int, int] = int(threadgroup_size)
+            inferred = infer_grid(ir, runtime_args, threadgroup_size, shape=shape)
+            if inferred is None:
+                n = infer_nthreads(runtime_args, nthreads=nthreads)
+                if n == 0:
+                    return 0.0
+                tpg: int | tuple[int, int, int] = int(n)
+                tptg: int | tuple[int, int, int] = int(threadgroup_size)
+            else:
+                gx, gy, gz = inferred
+                if gx == 0 or gy == 0 or gz == 0:
+                    return 0.0
+                tpg = (gx * int(threadgroup_size), gy, gz)
+                tptg = (int(threadgroup_size), 1, 1)
         else:
             gx, gy, gz = map(int, grid)
             if gx < 0 or gy < 0 or gz < 0:

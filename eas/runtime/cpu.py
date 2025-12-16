@@ -6,7 +6,7 @@ from typing import Any, Mapping
 import numpy as np
 
 from ..ir import DType, IRModule, ValueRef
-from .grid import infer_1d_grid
+from .grid import infer_1d_grid, infer_grid
 
 
 def _zero(dtype: DType) -> Any:
@@ -53,6 +53,7 @@ class CpuRuntime:
         sync: bool = True,
         nthreads: int | None = None,
         grid: tuple[int, int, int] | None = None,
+        shape: tuple[int, ...] | None = None,
     ) -> None:
         _ = meta
         _ = sync
@@ -60,8 +61,12 @@ class CpuRuntime:
         threadgroup_size: int = ck.threadgroup_size
 
         if grid is None:
-            gx = infer_1d_grid(runtime_args, threadgroup_size, nthreads=nthreads)
-            grid = (int(gx), 1, 1)
+            inferred = infer_grid(ir, runtime_args, threadgroup_size, shape=shape)
+            if inferred is None:
+                gx = infer_1d_grid(runtime_args, threadgroup_size, nthreads=nthreads)
+                grid = (int(gx), 1, 1)
+            else:
+                grid = inferred
         else:
             gx, gy, gz = map(int, grid)
             if gx < 0 or gy < 0 or gz < 0:

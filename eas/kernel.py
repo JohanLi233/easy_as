@@ -29,6 +29,25 @@ class Kernel:
         if not isinstance(sync, bool):
             raise TypeError(f"_sync must be bool, got {type(sync)!r}")
 
+        shape = kwargs.pop("_shape", None)
+        shape_norm: tuple[int, ...] | None
+        if shape is None:
+            shape_norm = None
+        else:
+            if isinstance(shape, (int,)):
+                dims = [int(shape)]
+            elif isinstance(shape, (tuple, list)):
+                dims = [int(x) for x in shape]
+            else:
+                raise TypeError(
+                    f"_shape must be int or tuple/list of ints, got {type(shape)!r}"
+                )
+            if len(dims) < 1:
+                raise ValueError("_shape must have >= 1 dim")
+            if any(d < 0 for d in dims):
+                raise ValueError("_shape dims must be >= 0")
+            shape_norm = tuple(dims)
+
         grid = kwargs.pop("_grid", None)
         grid_norm: tuple[int, int, int] | None
         if grid is None:
@@ -63,7 +82,12 @@ class Kernel:
                 raise ValueError("_nthreads must be >= 0")
         else:
             nthreads_i = None
-        return {"sync": sync, "nthreads": nthreads_i, "grid": grid_norm}
+        return {
+            "sync": sync,
+            "nthreads": nthreads_i,
+            "grid": grid_norm,
+            "shape": shape_norm,
+        }
 
     def _compile_from_split(
         self, meta: dict[str, Any], runtime_args: dict[str, Any]

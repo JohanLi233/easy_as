@@ -156,7 +156,15 @@ def ir_to_msl(ir: IRModule) -> tuple[str, int]:
                     if load_mask.id != mask_ref.id:
                         ok = False
                         break
-                elif def_inst.op in {"add", "mul", "floordiv", "mod", "lt", "where", "const"}:
+                elif def_inst.op in {
+                    "add",
+                    "mul",
+                    "floordiv",
+                    "mod",
+                    "lt",
+                    "where",
+                    "const",
+                }:
                     pass
                 else:
                     ok = False

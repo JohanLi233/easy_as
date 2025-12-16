@@ -19,24 +19,24 @@ except ImportError:
 
 
 @eas.kernel
-def matmul_kernel(a, b, c, M, N, BLOCK: eas.constexpr, K: eas.constexpr):
+def matmul_kernel(a, b, c, H, W, BLOCK: eas.constexpr, K: eas.constexpr):
     """
-    Naive matmul: C[M, N] = A[M, K] @ B[K, N]
+    Naive matmul: C[H, W] = A[H, K] @ B[K, W]
 
     2D grid：
-      - program_id(0) = row
-      - program_id(1) = tile_col
+      - program_id(0) = tile_col
+      - program_id(1) = row
     """
-    row = mk.program_id(0)
-    tile = mk.program_id(1)
+    tile = mk.program_id(0)
+    row = mk.program_id(1)
     col = tile * BLOCK + mk.arange(0, BLOCK)
-    out = row * N + col
-    mask = mk.where(row < M, col < N, False)
+    out = row * W + col
+    mask = mk.where(row < H, col < W, False)
 
     acc = 0.0
     for k in range(K):
         a_off = row * K + k
-        b_off = k * N + col
+        b_off = k * W + col
         acc = acc + mk.load(a, a_off, mask) * mk.load(b, b_off, mask)
     mk.store(c, out, acc, mask)
 
@@ -82,8 +82,6 @@ def main(argv: list[str] | None = None) -> None:
     if m <= 0 or n <= 0 or k <= 0 or block <= 0 or iters <= 0:
         raise SystemExit("--m/--n/--k/--block/--iters must be > 0")
 
-    tiles_n = (n + block - 1) // block
-
     device = _torch_device_for_runtime(runtime_name)
     a2 = torch.randn((m, k), dtype=torch.float32, device=device)
     b2 = torch.randn((k, n), dtype=torch.float32, device=device)
@@ -93,7 +91,7 @@ def main(argv: list[str] | None = None) -> None:
     b = b2.reshape(-1)
     c = c2.reshape(-1)
 
-    matmul_kernel(a, b, c, m, n, BLOCK=block, K=k, _grid=(m, tiles_n))
+    matmul_kernel(a, b, c, m, n, BLOCK=block, K=k)
     if device.type == "mps":
         torch.mps.synchronize()
     expected = a2 @ b2
@@ -116,9 +114,8 @@ def main(argv: list[str] | None = None) -> None:
         warmup = min(5, iters)
         t = runtime.benchmark(
             ck,
-            {"a": a, "b": b, "c": c, "M": m, "N": n},
+            {"a": a, "b": b, "c": c, "H": m, "W": n},
             {"BLOCK": block, "K": k},
-            grid=(m, tiles_n, 1),
             repeat=iters,
             warmup=warmup,
             torch_mps_sync=False,
@@ -136,7 +133,6 @@ def main(argv: list[str] | None = None) -> None:
                 n,
                 BLOCK=block,
                 K=k,
-                _grid=(m, tiles_n),
                 _sync=False,
             )
         if hasattr(runtime, "synchronize"):

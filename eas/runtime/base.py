@@ -16,6 +16,7 @@ class Runtime(Protocol):
         sync: bool = True,
         nthreads: int | None = None,
         grid: tuple[int, int, int] | None = None,
+        shape: tuple[int, ...] | None = None,
     ) -> None: ...
 
     def synchronize(self) -> None: ...

@@ -70,7 +70,7 @@ class TestMatmulKernel(unittest.TestCase):
             a2 = np.random.randn(m, k).astype(np.float32)
             b2 = np.random.randn(k, n).astype(np.float32)
             tiles_n = (n + block - 1) // block
-            nthreads = m * tiles_n * block
+            m * tiles_n * block
 
             a = eas.tensor(a2.reshape(-1), device="mps")
             b = eas.tensor(b2.reshape(-1), device="mps")
