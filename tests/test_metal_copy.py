@@ -37,4 +37,3 @@ class TestMetalCopy(unittest.TestCase):
         mod.copy_from_host(buf, src)
         mod.copy_to_host(buf, dst)
         self.assertEqual(dst, src)
-

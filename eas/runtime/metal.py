@@ -18,6 +18,10 @@ def _is_tensor(v: Any) -> bool:
     return bool(getattr(v, "__eas_tensor__", False))
 
 
+def _is_numpy_array(v: Any) -> bool:
+    return isinstance(v, np.ndarray)
+
+
 def _pack_scalar(dtype: DType, value: Any) -> bytes:
     if dtype == DType.U32:
         return struct.pack("<I", int(value))
@@ -136,10 +140,13 @@ class MetalRuntime:
         writes: set[str] | frozenset[str],
         *,
         torch_mps_sync: bool | None,
-    ) -> tuple[list[object], list[bool]]:
+    ) -> tuple[list[object], list[bool], list[tuple[object, np.ndarray]]]:
         argv: list[object] = []
         writable: list[bool] = []
+        host_copies: list[tuple[object, np.ndarray]] = []
         torch_mod = self._get_torch()
+        mod = self._mod()
+        np_capsule_cache: dict[int, object] = {}
 
         torch_mps_sync_enabled = (
             self._torch_mps_sync_enabled() if torch_mps_sync is None else torch_mps_sync
@@ -174,21 +181,35 @@ class MetalRuntime:
                         writable.append(arg.name in writes)
                         continue
                     v = v.numpy()  # type: ignore[assignment]
-                if not isinstance(v, np.ndarray):
-                    raise TypeError(
-                        f"expected numpy.ndarray or eas.Tensor for {arg.name!r}, got {type(v)!r}"
-                    )
-                if v.dtype != np.float32:
-                    raise TypeError(f"{arg.name!r} must be float32, got {v.dtype}")
-                if not v.flags.c_contiguous:
-                    raise ValueError(f"{arg.name!r} must be C-contiguous for MVP")
-                argv.append(v)
-                writable.append(arg.name in writes)
+                if _is_numpy_array(v):
+                    if v.dtype != np.float32:
+                        raise TypeError(f"{arg.name!r} must be float32, got {v.dtype}")
+                    if not v.flags.c_contiguous:
+                        raise ValueError(f"{arg.name!r} must be C-contiguous for MVP")
+
+                    # The Metal extension launch path expects buffer capsules, not numpy arrays.
+                    # Bridge numpy arrays through temporary shared MTLBuffers and sync copies.
+                    key = id(v)
+                    cap = np_capsule_cache.get(key)
+                    if cap is None:
+                        cap = mod.alloc_buffer(int(v.nbytes), "shared")
+                        mod.copy_from_host(cap, v)
+                        np_capsule_cache[key] = cap
+                    argv.append(cap)
+                    is_writable = arg.name in writes
+                    writable.append(is_writable)
+                    if is_writable:
+                        host_copies.append((cap, v))
+                    continue
+
+                raise TypeError(
+                    f"expected numpy.ndarray or eas.Tensor for {arg.name!r}, got {type(v)!r}"
+                )
             else:
                 argv.append(_pack_scalar(arg.dtype, v))
                 writable.append(False)
 
-        return argv, writable
+        return argv, writable, host_copies
 
     def run(
         self,
@@ -213,7 +234,7 @@ class MetalRuntime:
             return
         writes = ck.writes
 
-        argv, writable = self._build_argv(
+        argv, writable, host_copies = self._build_argv(
             ir, runtime_args, writes, torch_mps_sync=None
         )
 
@@ -225,10 +246,17 @@ class MetalRuntime:
             if use_thread_count_launch
             else (int(n) + int(threadgroup_size) - 1) // int(threadgroup_size)
         )
+        # If we bridged numpy arrays through temporary buffers, we must copy results
+        # back to host. Keep this path synchronous for correctness.
+        if host_copies:
+            sync = True
+
         if sync or not callable(getattr(mod, "launch_async", None)):
             mod.launch(
                 pipeline, argv, writable, int(grid_or_threads), int(threadgroup_size)
             )
+            for cap, arr in host_copies:
+                mod.copy_to_host(cap, arr)
             return
 
         pending = mod.launch_async(
@@ -280,9 +308,14 @@ class MetalRuntime:
         if n == 0:
             return 0.0
 
-        argv, writable = self._build_argv(
+        argv, writable, host_copies = self._build_argv(
             ir, runtime_args, ck.writes, torch_mps_sync=torch_mps_sync
         )
+        if host_copies:
+            raise ValueError(
+                "benchmark() with numpy inputs is not supported for Metal backend; "
+                "use eas.Tensor(device='mps') or torch MPS tensors for device-native timing"
+            )
         pipeline = self._get_pipeline(ck)
         mod = self._mod()
         use_thread_count_launch = callable(getattr(mod, "launch_tg", None))

@@ -1013,6 +1013,7 @@ static PyObject* launch_threads_impl(PyObject* args, bool async) {
       Py_DECREF(writable);
       Py_DECREF(argv);
       PyErr_NoMemory();
+      [enc endEncoding];
       return nullptr;
     }
     Py_ssize_t nkeepalive = 0;
@@ -1030,6 +1031,7 @@ static PyObject* launch_threads_impl(PyObject* args, bool async) {
       free(keepalive);
       Py_DECREF(writable);
       Py_DECREF(argv);
+      [enc endEncoding];
       return nullptr;
     }
     nkeepalive += nbuf_keepalive;
@@ -1169,6 +1171,7 @@ static PyObject* launch_threadgroups_impl(PyObject* args, bool async) {
       Py_DECREF(writable);
       Py_DECREF(argv);
       PyErr_NoMemory();
+      [enc endEncoding];
       return nullptr;
     }
     Py_ssize_t nkeepalive = 0;
@@ -1183,6 +1186,7 @@ static PyObject* launch_threadgroups_impl(PyObject* args, bool async) {
       free(keepalive);
       Py_DECREF(writable);
       Py_DECREF(argv);
+      [enc endEncoding];
       return nullptr;
     }
     nkeepalive += nbuf_keepalive;
