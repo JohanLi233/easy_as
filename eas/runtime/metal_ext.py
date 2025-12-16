@@ -11,7 +11,7 @@ def load_metal_ext(*, require: bool) -> Any | None:
         if require:
             raise RuntimeError(
                 "Metal backend is not built. Run `uv run python tools/build_metal_ext.py` "
-                "to build `eas._metal`, or set `EAS_BACKEND=cpu` to use CPU fallback."
+                "to build `eas._metal`."
             )
         return None
 

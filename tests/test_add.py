@@ -19,9 +19,13 @@ def add_kernel(a, b, c, N, BLOCK: eas.constexpr):
 
 
 class TestAddKernel(unittest.TestCase):
-    def test_add_cpu_numpy(self) -> None:
+    def test_add_mps_numpy(self) -> None:
+        rt = get_runtime("mps")
+        if not rt.is_available():
+            self.skipTest("MPS is not available")
+
         old = os.environ.get("EAS_BACKEND")
-        os.environ["EAS_BACKEND"] = "cpu"
+        os.environ["EAS_BACKEND"] = "mps"
         try:
             n = 4096 + 3
             a = np.random.randn(n).astype(np.float32)

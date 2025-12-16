@@ -1,6 +1,6 @@
 # easy_as
 
-Python优先的内核 DSL（追踪）→ IR → Metal Shading Language (MSL) 代码生成，配备 Metal + CPU 运行时。
+Python优先的内核 DSL（追踪）→ IR → Metal Shading Language (MSL) 代码生成，配备 Metal(MPS) 运行时。
 
 ## 快速开始：元素级加法
 
@@ -110,7 +110,7 @@ z = eas.to_dlpack(y)               # DLPack 胶囊（CPU；torch 风格）
 
 ### 环境变量
 
-- `EAS_BACKEND=auto|cpu|mps`：选择后端
+- `EAS_BACKEND=auto|mps`：选择后端
 - `EAS_MAX_IN_FLIGHT`：最大异步启动数量（在使用 `_sync=False` 调用内核时使用）
 
 ### 使用 uv

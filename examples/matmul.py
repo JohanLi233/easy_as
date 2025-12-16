@@ -70,7 +70,12 @@ def main(argv: list[str] | None = None) -> None:
         )
 
     backend_env = os.environ.get("EAS_BACKEND", "auto")
-    runtime = get_runtime()
+    try:
+        runtime = get_runtime()
+    except Exception as e:
+        raise SystemExit(
+            f"failed to initialize runtime (EAS_BACKEND={backend_env!r}): {e}"
+        )
     runtime_name = runtime.__class__.__name__
     print(f"backend={backend_env} -> {runtime_name}")
 

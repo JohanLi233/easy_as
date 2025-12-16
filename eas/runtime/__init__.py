@@ -3,12 +3,10 @@ from __future__ import annotations
 import os
 from typing import Literal, TYPE_CHECKING
 
-from .cpu import CpuRuntime
 from .base import Runtime
 
 __all__ = ["get_runtime"]
 
-_cpu = CpuRuntime()
 _metal = None
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -16,24 +14,32 @@ if TYPE_CHECKING:  # pragma: no cover
 
 
 def get_runtime(
-    backend: Literal["auto", "cpu", "mps", "metal"] | None = None,
+    backend: Literal["auto", "mps", "metal"] | None = None,
 ) -> Runtime:
     backend = (backend or os.environ.get("EAS_BACKEND", "auto")).lower()
     if backend == "metal":
         backend = "mps"
-    if backend == "cpu":
-        return _cpu
     if backend == "mps":
-        return _get_metal()
+        metal = _get_metal()
+        if not metal.is_available():
+            raise RuntimeError(
+                "MPS runtime is not available. Build the Metal extension with "
+                "`uv run python tools/build_metal_ext.py` (macOS + Xcode SDK required)."
+            )
+        return metal
     if backend == "auto":
-        try:
-            metal = _get_metal()
-            if metal.is_available():
-                return metal
-        except Exception:
-            pass
-        return _cpu
-    raise ValueError(f"unsupported backend: {backend!r} (expected 'auto'|'cpu'|'mps')")
+        metal = _get_metal()
+        if not metal.is_available():
+            raise RuntimeError(
+                "No available runtime (expected Metal/MPS). Build the Metal extension with "
+                "`uv run python tools/build_metal_ext.py` (macOS + Xcode SDK required)."
+            )
+        return metal
+    if backend == "cpu":
+        raise ValueError(
+            "unsupported backend: 'cpu' (CPU runtime was removed; use 'mps' or 'auto')"
+        )
+    raise ValueError(f"unsupported backend: {backend!r} (expected 'auto'|'mps')")
 
 
 def _get_metal() -> "MetalRuntime":

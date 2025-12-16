@@ -32,27 +32,15 @@ class TestTorchInterop(unittest.TestCase):
     def test_cpu_zero_copy_wrap(self) -> None:
         import torch  # type: ignore
 
-        old = os.environ.get("EAS_BACKEND")
-        os.environ["EAS_BACKEND"] = "cpu"
-        try:
-            n = 4096 + 3
-            a_t = torch.randn(n, device="cpu", dtype=torch.float32)
-            b_t = torch.randn(n, device="cpu", dtype=torch.float32)
-            c_t = torch.zeros(n, device="cpu", dtype=torch.float32)
+        n = 1024 + 3
+        a_t = torch.zeros(n, device="cpu", dtype=torch.float32)
+        a = eas.tensor(a_t, device="cpu")
 
-            a = eas.tensor(a_t, device="cpu")
-            b = eas.tensor(b_t, device="cpu")
-            c = eas.tensor(c_t, device="cpu")
+        a_t.add_(1.0)
+        np.testing.assert_allclose(a.numpy(), a_t.numpy(), rtol=0, atol=0)
 
-            add_kernel(a, b, c, n, BLOCK=256)
-
-            # c_t should reflect results without an explicit copy.
-            np.testing.assert_allclose(c_t.numpy(), a_t.numpy() + b_t.numpy())
-        finally:
-            if old is None:
-                os.environ.pop("EAS_BACKEND", None)
-            else:
-                os.environ["EAS_BACKEND"] = old
+        a.numpy()[0] = 7.0
+        self.assertEqual(float(a_t[0].item()), 7.0)
 
     def test_mps_zero_copy_via_dlpack(self) -> None:
         import torch  # type: ignore

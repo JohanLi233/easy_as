@@ -19,9 +19,13 @@ def add_kernel(a, b, c, N, BLOCK: eas.constexpr):
 
 
 class TestTensorCpu(unittest.TestCase):
-    def test_cpu_tensor_kernel(self) -> None:
+    def test_cpu_tensor_kernel_via_mps(self) -> None:
+        rt = get_runtime("mps")
+        if not rt.is_available():
+            self.skipTest("MPS is not available")
+
         old = os.environ.get("EAS_BACKEND")
-        os.environ["EAS_BACKEND"] = "cpu"
+        os.environ["EAS_BACKEND"] = "mps"
         try:
             n = 4096 + 3
             a = eas.tensor(np.random.randn(n).astype(np.float32), device="cpu")
