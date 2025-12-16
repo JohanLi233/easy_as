@@ -51,13 +51,25 @@ class CpuRuntime:
         meta: Mapping[str, Any],
         *,
         sync: bool = True,
+        nthreads: int | None = None,
+        grid: tuple[int, int, int] | None = None,
     ) -> None:
         _ = meta
         _ = sync
         ir: IRModule = ck.ir
         threadgroup_size: int = ck.threadgroup_size
 
-        grid = infer_1d_grid(runtime_args, threadgroup_size)
+        if grid is None:
+            gx = infer_1d_grid(runtime_args, threadgroup_size, nthreads=nthreads)
+            grid = (int(gx), 1, 1)
+        else:
+            gx, gy, gz = map(int, grid)
+            if gx < 0 or gy < 0 or gz < 0:
+                raise ValueError("grid dims must be >= 0")
+            grid = (gx, gy, gz)
+        gx, gy, gz = grid
+        if gx == 0 or gy == 0 or gz == 0:
+            return
 
         # Prepare runtime binding for args (name -> value)
         arg_values: dict[str, Any] = {}
@@ -89,11 +101,19 @@ class CpuRuntime:
                         f"{arg.name!r} must be {expected.name} for this kernel, got {arr.dtype}"
                     )
 
-        for pid in range(grid):
-            for tid in range(threadgroup_size):
-                self._run_thread(
-                    ir, arg_values, pid=pid, tid=tid, threadgroup_size=threadgroup_size
-                )
+        for pid2 in range(gz):
+            for pid1 in range(gy):
+                for pid0 in range(gx):
+                    for tid in range(threadgroup_size):
+                        self._run_thread(
+                            ir,
+                            arg_values,
+                            pid0=pid0,
+                            pid1=pid1,
+                            pid2=pid2,
+                            tid=tid,
+                            threadgroup_size=threadgroup_size,
+                        )
 
     def synchronize(self) -> None:
         return None
@@ -103,7 +123,9 @@ class CpuRuntime:
         ir: IRModule,
         arg_values: Mapping[str, Any],
         *,
-        pid: int,
+        pid0: int,
+        pid1: int,
+        pid2: int,
         tid: int,
         threadgroup_size: int,
     ) -> None:
@@ -127,17 +149,27 @@ class CpuRuntime:
                 out = inst.out
                 assert out is not None
                 axis = int(inst.args[0])
-                if axis != 0:
-                    raise ValueError("only program_id(0) is supported in MVP")
-                env[out.id] = pid
+                if axis == 0:
+                    env[out.id] = pid0
+                elif axis == 1:
+                    env[out.id] = pid1
+                elif axis == 2:
+                    env[out.id] = pid2
+                else:
+                    raise ValueError(f"program_id axis must be 0/1/2, got {axis}")
                 continue
             if inst.op == "thread_id":
                 out = inst.out
                 assert out is not None
                 axis = int(inst.args[0])
-                if axis != 0:
-                    raise ValueError("only thread_id(0) is supported in MVP")
-                env[out.id] = pid * threadgroup_size + tid
+                if axis == 0:
+                    env[out.id] = pid0 * threadgroup_size + tid
+                elif axis == 1:
+                    env[out.id] = pid1
+                elif axis == 2:
+                    env[out.id] = pid2
+                else:
+                    raise ValueError(f"thread_id axis must be 0/1/2, got {axis}")
                 continue
             if inst.op == "arange":
                 out = inst.out
@@ -159,6 +191,16 @@ class CpuRuntime:
                     env[out.id] = av * bv
                 else:
                     env[out.id] = av < bv
+                continue
+            if inst.op in {"floordiv", "mod"}:
+                out = inst.out
+                assert out is not None
+                a, b = inst.args  # type: ignore[misc]
+                av = int(env[a.id])
+                bv = int(env[b.id])
+                if bv == 0:
+                    raise ZeroDivisionError("division by zero in kernel")
+                env[out.id] = av // bv if inst.op == "floordiv" else av % bv
                 continue
             if inst.op == "where":
                 out = inst.out

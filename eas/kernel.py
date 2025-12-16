@@ -28,7 +28,42 @@ class Kernel:
         sync = kwargs.pop("_sync", True)
         if not isinstance(sync, bool):
             raise TypeError(f"_sync must be bool, got {type(sync)!r}")
-        return {"sync": sync}
+
+        grid = kwargs.pop("_grid", None)
+        grid_norm: tuple[int, int, int] | None
+        if grid is None:
+            grid_norm = None
+        else:
+            if isinstance(grid, (int,)):
+                dims = [int(grid)]
+            elif isinstance(grid, (tuple, list)):
+                dims = [int(x) for x in grid]
+            else:
+                raise TypeError(
+                    f"_grid must be int or tuple/list of ints, got {type(grid)!r}"
+                )
+            if not (1 <= len(dims) <= 3):
+                raise ValueError("_grid must have 1..3 dims")
+            while len(dims) < 3:
+                dims.append(1)
+            gx, gy, gz = dims
+            if gx < 0 or gy < 0 or gz < 0:
+                raise ValueError("_grid dims must be >= 0")
+            grid_norm = (gx, gy, gz)
+
+        nthreads = kwargs.pop("_nthreads", None)
+        if nthreads is not None:
+            try:
+                nthreads_i = int(nthreads)
+            except Exception as e:  # pragma: no cover
+                raise TypeError(
+                    f"_nthreads must be an int-like value, got {type(nthreads)!r}"
+                ) from e
+            if nthreads_i < 0:
+                raise ValueError("_nthreads must be >= 0")
+        else:
+            nthreads_i = None
+        return {"sync": sync, "nthreads": nthreads_i, "grid": grid_norm}
 
     def _compile_from_split(
         self, meta: dict[str, Any], runtime_args: dict[str, Any]

@@ -181,6 +181,28 @@ class _IRBuilder:
         self.insts.append(Inst("mul", out.ref, (av.ref, bv.ref)))
         return out
 
+    def floordiv(self, a: Any, b: Any) -> mk.val:
+        av = self._coerce(a)
+        bv = self._coerce(b)
+        if av.dtype != bv.dtype:
+            raise TypeError(f"floordiv dtype mismatch: {av.dtype} vs {bv.dtype}")
+        if av.dtype != DType.U32:
+            raise TypeError(f"floordiv expects u32, got {av.dtype}")
+        out = self._new(DType.U32)
+        self.insts.append(Inst("floordiv", out.ref, (av.ref, bv.ref)))
+        return out
+
+    def mod(self, a: Any, b: Any) -> mk.val:
+        av = self._coerce(a)
+        bv = self._coerce(b)
+        if av.dtype != bv.dtype:
+            raise TypeError(f"mod dtype mismatch: {av.dtype} vs {bv.dtype}")
+        if av.dtype != DType.U32:
+            raise TypeError(f"mod expects u32, got {av.dtype}")
+        out = self._new(DType.U32)
+        self.insts.append(Inst("mod", out.ref, (av.ref, bv.ref)))
+        return out
+
     def lt(self, a: Any, b: Any) -> mk.val:
         av = self._coerce(a)
         bv = self._coerce(b)
@@ -414,6 +436,10 @@ def _cse_pure(ir: IRModule) -> IRModule:
             assert isinstance(a_ref, ValueRef) and isinstance(b_ref, ValueRef)
             x, y = (a_ref, b_ref) if a_ref.id <= b_ref.id else (b_ref, a_ref)
             return (inst.op, out.dtype, x.id, y.id)
+        if inst.op in {"floordiv", "mod"}:
+            a_ref, b_ref = (_remap_arg(inst.args[0]), _remap_arg(inst.args[1]))
+            assert isinstance(a_ref, ValueRef) and isinstance(b_ref, ValueRef)
+            return (inst.op, out.dtype, a_ref.id, b_ref.id)
         if inst.op == "lt":
             a_ref, b_ref = (_remap_arg(inst.args[0]), _remap_arg(inst.args[1]))
             assert isinstance(a_ref, ValueRef) and isinstance(b_ref, ValueRef)

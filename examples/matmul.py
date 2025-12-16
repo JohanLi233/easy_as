@@ -19,22 +19,24 @@ except ImportError:
 
 
 @eas.kernel
-def matmul_kernel(a, b, c, N, BLOCK: eas.constexpr, K: eas.constexpr):
+def matmul_kernel(a, b, c, M, N, BLOCK: eas.constexpr, K: eas.constexpr):
     """
-    Naive matmul: C[M, BLOCK] = A[M, K] @ B[K, BLOCK]
+    Naive matmul: C[M, N] = A[M, K] @ B[K, N]
 
-    MVP 限制：仅支持 1D grid + 1D threadgroup，因此这里把输出列数固定为 BLOCK，
-    并把 grid sizing 的 `N` 设为 `M * BLOCK`（这样 grid.x == M）。
+    2D grid：
+      - program_id(0) = row
+      - program_id(1) = tile_col
     """
-    pid = mk.program_id(0)  # row index
-    col = mk.arange(0, BLOCK)  # thread id within row
-    out = pid * BLOCK + col
-    mask = out < N
+    row = mk.program_id(0)
+    tile = mk.program_id(1)
+    col = tile * BLOCK + mk.arange(0, BLOCK)
+    out = row * N + col
+    mask = mk.where(row < M, col < N, False)
 
     acc = 0.0
     for k in range(K):
-        a_off = pid * K + k
-        b_off = k * BLOCK + col
+        a_off = row * K + k
+        b_off = k * N + col
         acc = acc + mk.load(a, a_off, mask) * mk.load(b, b_off, mask)
     mk.store(c, out, acc, mask)
 
@@ -50,12 +52,13 @@ def _torch_device_for_runtime(runtime_name: str) -> "torch.device":
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="easy_as 朴素矩阵乘演示（matmul）")
     parser.add_argument("--m", type=int, default=128, help="M（行数）")
+    parser.add_argument("--n", type=int, default=256, help="N（列数）")
     parser.add_argument("--k", type=int, default=64, help="K（constexpr，展开）")
     parser.add_argument(
         "--block",
         type=int,
         default=256,
-        help="BLOCK（线程组大小；也是输出列数 N）",
+        help="BLOCK（线程组大小；列方向 tile 宽度）",
     )
     parser.add_argument("--iters", type=int, default=1, help="计时的迭代次数")
     parser.add_argument("--print-msl", action="store_true", help="打印生成的 MSL")
@@ -72,24 +75,25 @@ def main(argv: list[str] | None = None) -> None:
     print(f"backend={backend_env} -> {runtime_name}")
 
     m = int(args.m)
+    n = int(args.n)
     k = int(args.k)
     block = int(args.block)
     iters = int(args.iters)
-    if m <= 0 or k <= 0 or block <= 0 or iters <= 0:
-        raise SystemExit("--m/--k/--block/--iters must be > 0")
+    if m <= 0 or n <= 0 or k <= 0 or block <= 0 or iters <= 0:
+        raise SystemExit("--m/--n/--k/--block/--iters must be > 0")
 
-    n_total = m * block
+    tiles_n = (n + block - 1) // block
 
     device = _torch_device_for_runtime(runtime_name)
     a2 = torch.randn((m, k), dtype=torch.float32, device=device)
-    b2 = torch.randn((k, block), dtype=torch.float32, device=device)
-    c2 = torch.empty((m, block), dtype=torch.float32, device=device)
+    b2 = torch.randn((k, n), dtype=torch.float32, device=device)
+    c2 = torch.empty((m, n), dtype=torch.float32, device=device)
 
     a = a2.reshape(-1)
     b = b2.reshape(-1)
     c = c2.reshape(-1)
 
-    matmul_kernel(a, b, c, n_total, BLOCK=block, K=k)
+    matmul_kernel(a, b, c, m, n, BLOCK=block, K=k, _grid=(m, tiles_n))
     if device.type == "mps":
         torch.mps.synchronize()
     expected = a2 @ b2
@@ -98,7 +102,7 @@ def main(argv: list[str] | None = None) -> None:
     else:
         if not torch.allclose(c2, expected, rtol=1e-4, atol=1e-5):
             raise AssertionError("torch.allclose failed")
-    print(f"OK（正确性验证，设备={device}，形状=({m},{k})x({k},{block}))")
+    print(f"OK（正确性验证，设备={device}，形状=({m},{k})x({k},{n}))")
 
     if hasattr(runtime, "synchronize"):
         runtime.synchronize()
@@ -108,12 +112,13 @@ def main(argv: list[str] | None = None) -> None:
     eas_ms: float
     eas_mode: str
     if runtime_name == "MetalRuntime" and callable(getattr(runtime, "benchmark", None)):
-        ck = matmul_kernel.compile(a, b, c, n_total, BLOCK=block, K=k)
+        ck = matmul_kernel.compile(a, b, c, m, n, BLOCK=block, K=k)
         warmup = min(5, iters)
         t = runtime.benchmark(
             ck,
-            {"a": a, "b": b, "c": c, "N": n_total},
+            {"a": a, "b": b, "c": c, "M": m, "N": n},
             {"BLOCK": block, "K": k},
+            grid=(m, tiles_n, 1),
             repeat=iters,
             warmup=warmup,
             torch_mps_sync=False,
@@ -123,7 +128,17 @@ def main(argv: list[str] | None = None) -> None:
     else:
         t0 = time.perf_counter()
         for _ in range(iters):
-            matmul_kernel(a, b, c, n_total, BLOCK=block, K=k, _sync=False)
+            matmul_kernel(
+                a,
+                b,
+                c,
+                m,
+                n,
+                BLOCK=block,
+                K=k,
+                _grid=(m, tiles_n),
+                _sync=False,
+            )
         if hasattr(runtime, "synchronize"):
             runtime.synchronize()
         if device.type == "mps":
@@ -151,7 +166,7 @@ def main(argv: list[str] | None = None) -> None:
     print(f"ratio eas/torch: {ratio:.2f}x")
 
     if args.print_msl:
-        print(matmul_kernel.to_msl(a, b, c, n_total, BLOCK=block, K=k))
+        print(matmul_kernel.to_msl(a, b, c, m, n, BLOCK=block, K=k))
 
 
 if __name__ == "__main__":

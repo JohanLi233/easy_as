@@ -14,6 +14,8 @@ class Runtime(Protocol):
         meta: Mapping[str, Any],
         *,
         sync: bool = True,
+        nthreads: int | None = None,
+        grid: tuple[int, int, int] | None = None,
     ) -> None: ...
 
     def synchronize(self) -> None: ...

@@ -932,27 +932,88 @@ static bool bind_args_fast(
 // Python signature:
 //   launch(pipeline, argv, writable, threads_per_grid, threads_per_threadgroup=0, repeat=1)
 //   launch_async(pipeline, argv, writable, threads_per_grid, threads_per_threadgroup=0, repeat=1)
+//
+// `threads_per_grid` and `threads_per_threadgroup` may be:
+//   - int: treated as (x, 1, 1)
+//   - tuple/list of 1..3 ints: treated as (x, y, z) with missing dims defaulting to 1.
+static bool parse_size3(
+    PyObject* obj,
+    unsigned long long* x,
+    unsigned long long* y,
+    unsigned long long* z,
+    const char* what) {
+  if (!obj) {
+    PyErr_Format(PyExc_TypeError, "%s must be provided", what);
+    return false;
+  }
+  if (PyLong_Check(obj)) {
+    unsigned long long xv = PyLong_AsUnsignedLongLong(obj);
+    if (PyErr_Occurred()) return false;
+    *x = xv;
+    *y = 1;
+    *z = 1;
+    return true;
+  }
+  if (PyTuple_Check(obj) || PyList_Check(obj)) {
+    PyObject* seq = PySequence_Fast(obj, "expected a tuple/list");
+    if (!seq) return false;
+    const Py_ssize_t n = PySequence_Fast_GET_SIZE(seq);
+    if (n < 1 || n > 3) {
+      Py_DECREF(seq);
+      PyErr_Format(PyExc_ValueError, "%s must have 1..3 dims", what);
+      return false;
+    }
+    unsigned long long dims[3] = {1, 1, 1};
+    for (Py_ssize_t i = 0; i < n; i++) {
+      PyObject* item = PySequence_Fast_GET_ITEM(seq, i);
+      if (!PyLong_Check(item)) {
+        Py_DECREF(seq);
+        PyErr_Format(PyExc_TypeError, "%s dim %zd must be int", what, (long long)i);
+        return false;
+      }
+      unsigned long long dv = PyLong_AsUnsignedLongLong(item);
+      if (PyErr_Occurred()) {
+        Py_DECREF(seq);
+        return false;
+      }
+      dims[(size_t)i] = dv;
+    }
+    Py_DECREF(seq);
+    *x = dims[0];
+    *y = dims[1];
+    *z = dims[2];
+    return true;
+  }
+  PyErr_Format(PyExc_TypeError, "%s must be int or tuple/list of ints", what);
+  return false;
+}
+
 static PyObject* launch_threads_impl(PyObject* args, bool async) {
   PyObject* pipeline_capsule = nullptr;
   PyObject* argv_obj = nullptr;
   PyObject* writable_obj = nullptr;
 
-  unsigned long long threads_per_grid_ull = 0;
-  unsigned long long threads_per_tg_ull = 0;
+  PyObject* tpg_obj = nullptr;
+  PyObject* tptg_obj = nullptr;
   int repeat = 1;
 
   if (!PyArg_ParseTuple(
-          args, "OOOK|Ki",
+          args, "OOOO|Oi",
           &pipeline_capsule, &argv_obj, &writable_obj,
-          &threads_per_grid_ull, &threads_per_tg_ull, &repeat)) {
-    return nullptr;
-  }
-  if (threads_per_grid_ull == 0) {
-    PyErr_SetString(PyExc_ValueError, "threads_per_grid must be > 0");
+          &tpg_obj, &tptg_obj, &repeat)) {
     return nullptr;
   }
   if (repeat <= 0) {
     PyErr_SetString(PyExc_ValueError, "repeat must be > 0");
+    return nullptr;
+  }
+
+  unsigned long long tpg_x = 0, tpg_y = 1, tpg_z = 1;
+  if (!parse_size3(tpg_obj, &tpg_x, &tpg_y, &tpg_z, "threads_per_grid")) {
+    return nullptr;
+  }
+  if (tpg_x == 0 || tpg_y == 0 || tpg_z == 0) {
+    PyErr_SetString(PyExc_ValueError, "threads_per_grid dims must be > 0");
     return nullptr;
   }
 
@@ -980,11 +1041,58 @@ static PyObject* launch_threads_impl(PyObject* args, bool async) {
     id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)pipeline->queue;
     id<MTLComputePipelineState> pso = (__bridge id<MTLComputePipelineState>)pipeline->pso;
 
-    NSUInteger tptg = pick_threads_per_threadgroup(pipeline, (NSUInteger)threads_per_tg_ull);
-    if (tptg > (NSUInteger)pipeline->max_threads_per_tg) {
+    const NSUInteger w = (pipeline->thread_execution_width > 0) ? (NSUInteger)pipeline->thread_execution_width : 32;
+    const NSUInteger maxT = (pipeline->max_threads_per_tg > 0) ? (NSUInteger)pipeline->max_threads_per_tg : 1024;
+
+    NSUInteger tptg_x = 0;
+    NSUInteger tptg_y = 1;
+    NSUInteger tptg_z = 1;
+    if (tptg_obj == nullptr) {
+      // Auto threadgroup shape.
+      // - 1D: pick a solid default (usually 256) for elementwise kernels.
+      // - 2D/3D: default to a compact tile with x ~= threadExecutionWidth (e.g. 32x8 = 256).
+      const NSUInteger total = pick_threads_per_threadgroup(pipeline, /*requested=*/0);
+      if (tpg_y > 1 || tpg_z > 1) {
+        tptg_x = (tpg_x < (unsigned long long)w) ? (NSUInteger)tpg_x : w;
+        if (tptg_x == 0) tptg_x = 1;
+        tptg_y = total / tptg_x;
+        if (tptg_y == 0) tptg_y = 1;
+        if (tptg_y > (NSUInteger)tpg_y) tptg_y = (NSUInteger)tpg_y;
+        // Keep total threads within device limit.
+        while ((unsigned long long)tptg_x * (unsigned long long)tptg_y > (unsigned long long)maxT && tptg_y > 1) {
+          tptg_y--;
+        }
+        // Ensure the total thread count is at least one SIMD-group.
+        if ((unsigned long long)tptg_x * (unsigned long long)tptg_y < (unsigned long long)w) {
+          tptg_x = (tpg_x < (unsigned long long)w) ? (NSUInteger)tpg_x : w;
+          tptg_y = 1;
+        }
+      } else {
+        tptg_x = total;
+      }
+    } else {
+      unsigned long long tptg_x_ull = 0, tptg_y_ull = 1, tptg_z_ull = 1;
+      if (!parse_size3(tptg_obj, &tptg_x_ull, &tptg_y_ull, &tptg_z_ull, "threads_per_threadgroup")) {
+        Py_DECREF(writable);
+        Py_DECREF(argv);
+        return nullptr;
+      }
+      if (tptg_y_ull == 0 || tptg_z_ull == 0) {
+        Py_DECREF(writable);
+        Py_DECREF(argv);
+        PyErr_SetString(PyExc_ValueError, "threads_per_threadgroup dims must be > 0");
+        return nullptr;
+      }
+      tptg_x = pick_threads_per_threadgroup(pipeline, (NSUInteger)tptg_x_ull);
+      tptg_y = (NSUInteger)tptg_y_ull;
+      tptg_z = (NSUInteger)tptg_z_ull;
+    }
+    const unsigned long long tg_prod =
+        (unsigned long long)tptg_x * (unsigned long long)tptg_y * (unsigned long long)tptg_z;
+    if (tg_prod > (unsigned long long)pipeline->max_threads_per_tg) {
       Py_DECREF(writable);
       Py_DECREF(argv);
-      PyErr_Format(PyExc_ValueError, "threads_per_threadgroup too large: %lu", (unsigned long)tptg);
+      PyErr_Format(PyExc_ValueError, "threads_per_threadgroup too large: %llu", tg_prod);
       return nullptr;
     }
 
@@ -1037,9 +1145,8 @@ static PyObject* launch_threads_impl(PyObject* args, bool async) {
     nkeepalive += nbuf_keepalive;
 
     // Dispatch
-    const NSUInteger threads_per_grid = (NSUInteger)threads_per_grid_ull;
-    MTLSize tpg = MTLSizeMake(threads_per_grid, 1, 1);
-    MTLSize tg  = MTLSizeMake(tptg, 1, 1);
+    MTLSize tpg = MTLSizeMake((NSUInteger)tpg_x, (NSUInteger)tpg_y, (NSUInteger)tpg_z);
+    MTLSize tg  = MTLSizeMake(tptg_x, tptg_y, tptg_z);
 
     if ([enc respondsToSelector:@selector(dispatchThreads:threadsPerThreadgroup:)]) {
       for (int r = 0; r < repeat; r++) {
@@ -1047,8 +1154,10 @@ static PyObject* launch_threads_impl(PyObject* args, bool async) {
       }
     } else {
       // Fallback: emulate dispatchThreads.
-      const NSUInteger groups = (threads_per_grid + tptg - 1) / tptg;
-      MTLSize tgs = MTLSizeMake(groups, 1, 1);
+      const NSUInteger groups_x = ((NSUInteger)tpg_x + tptg_x - 1) / tptg_x;
+      const NSUInteger groups_y = ((NSUInteger)tpg_y + tptg_y - 1) / tptg_y;
+      const NSUInteger groups_z = ((NSUInteger)tpg_z + tptg_z - 1) / tptg_z;
+      MTLSize tgs = MTLSizeMake(groups_x, groups_y, groups_z);
       for (int r = 0; r < repeat; r++) {
         [enc dispatchThreadgroups:tgs threadsPerThreadgroup:tg];
       }
@@ -1093,26 +1202,43 @@ static PyObject* launch_threads_impl(PyObject* args, bool async) {
 // Compatibility helper: launch by threadgroup count (old semantics).
 // Python signature:
 //   launch_tg(pipeline, argv, writable, threadgroups, threads_per_threadgroup, repeat=1)
+//
+// `threadgroups` and `threads_per_threadgroup` accept the same int/tuple/list forms
+// as `launch(...)` above.
 // This simply dispatches threadgroups (exactly like your old version), but still uses the
 // fast arg binding rules (capsules + scalars only).
 static PyObject* launch_threadgroups_impl(PyObject* args, bool async) {
   PyObject* pipeline_capsule = nullptr;
   PyObject* argv_obj = nullptr;
   PyObject* writable_obj = nullptr;
-  unsigned long long threadgroups_ull = 0;
-  unsigned long long threads_ull = 0;
+  PyObject* tgs_obj = nullptr;
+  PyObject* tptg_obj = nullptr;
   int repeat = 1;
 
-  if (!PyArg_ParseTuple(args, "OOOKK|i", &pipeline_capsule, &argv_obj, &writable_obj,
-                        &threadgroups_ull, &threads_ull, &repeat)) {
-    return nullptr;
-  }
-  if (threadgroups_ull == 0 || threads_ull == 0) {
-    PyErr_SetString(PyExc_ValueError, "threadgroups and threads_per_threadgroup must be > 0");
+  if (!PyArg_ParseTuple(args, "OOOOO|i", &pipeline_capsule, &argv_obj, &writable_obj,
+                        &tgs_obj, &tptg_obj, &repeat)) {
     return nullptr;
   }
   if (repeat <= 0) {
     PyErr_SetString(PyExc_ValueError, "repeat must be > 0");
+    return nullptr;
+  }
+
+  unsigned long long tgs_x = 0, tgs_y = 1, tgs_z = 1;
+  if (!parse_size3(tgs_obj, &tgs_x, &tgs_y, &tgs_z, "threadgroups")) {
+    return nullptr;
+  }
+  if (tgs_x == 0 || tgs_y == 0 || tgs_z == 0) {
+    PyErr_SetString(PyExc_ValueError, "threadgroups dims must be > 0");
+    return nullptr;
+  }
+
+  unsigned long long tptg_x_ull = 0, tptg_y_ull = 1, tptg_z_ull = 1;
+  if (!parse_size3(tptg_obj, &tptg_x_ull, &tptg_y_ull, &tptg_z_ull, "threads_per_threadgroup")) {
+    return nullptr;
+  }
+  if (tptg_x_ull == 0 || tptg_y_ull == 0 || tptg_z_ull == 0) {
+    PyErr_SetString(PyExc_ValueError, "threads_per_threadgroup dims must be > 0");
     return nullptr;
   }
 
@@ -1140,11 +1266,11 @@ static PyObject* launch_threadgroups_impl(PyObject* args, bool async) {
     id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)pipeline->queue;
     id<MTLComputePipelineState> pso = (__bridge id<MTLComputePipelineState>)pipeline->pso;
 
-    const NSUInteger threads = (NSUInteger)threads_ull;
-    if (threads > (NSUInteger)pipeline->max_threads_per_tg) {
+    const unsigned long long tg_prod = tptg_x_ull * tptg_y_ull * tptg_z_ull;
+    if (tg_prod > (unsigned long long)pipeline->max_threads_per_tg) {
       Py_DECREF(writable);
       Py_DECREF(argv);
-      PyErr_Format(PyExc_ValueError, "threads_per_threadgroup exceeds device limit: %lu", (unsigned long)threads);
+      PyErr_Format(PyExc_ValueError, "threads_per_threadgroup exceeds device limit: %llu", tg_prod);
       return nullptr;
     }
 
@@ -1191,8 +1317,8 @@ static PyObject* launch_threadgroups_impl(PyObject* args, bool async) {
     }
     nkeepalive += nbuf_keepalive;
 
-    MTLSize tgs = MTLSizeMake((NSUInteger)threadgroups_ull, 1, 1);
-    MTLSize tg  = MTLSizeMake(threads, 1, 1);
+    MTLSize tgs = MTLSizeMake((NSUInteger)tgs_x, (NSUInteger)tgs_y, (NSUInteger)tgs_z);
+    MTLSize tg  = MTLSizeMake((NSUInteger)tptg_x_ull, (NSUInteger)tptg_y_ull, (NSUInteger)tptg_z_ull);
     for (int r = 0; r < repeat; r++) {
       [enc dispatchThreadgroups:tgs threadsPerThreadgroup:tg];
     }

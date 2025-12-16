@@ -53,6 +53,18 @@ class val:
     def __rmul__(self, other: Any) -> "val":
         return _b().mul(other, self)
 
+    def __floordiv__(self, other: Any) -> "val":
+        return _b().floordiv(self, other)
+
+    def __rfloordiv__(self, other: Any) -> "val":
+        return _b().floordiv(other, self)
+
+    def __mod__(self, other: Any) -> "val":
+        return _b().mod(self, other)
+
+    def __rmod__(self, other: Any) -> "val":
+        return _b().mod(other, self)
+
     def __lt__(self, other: Any) -> "val":
         return _b().lt(self, other)
 

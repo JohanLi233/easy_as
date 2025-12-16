@@ -156,7 +156,7 @@ def ir_to_msl(ir: IRModule) -> tuple[str, int]:
                     if load_mask.id != mask_ref.id:
                         ok = False
                         break
-                elif def_inst.op in {"add", "mul", "lt", "where", "const"}:
+                elif def_inst.op in {"add", "mul", "floordiv", "mod", "lt", "where", "const"}:
                     pass
                 else:
                     ok = False
@@ -254,17 +254,19 @@ def ir_to_msl(ir: IRModule) -> tuple[str, int]:
             out = inst.out
             assert out is not None
             axis = int(inst.args[0])
-            if axis != 0:
-                raise ValueError("only program_id(0) is supported in MVP")
-            lines.append(f"{indent}uint v{out.id} = tgpig.x;")
+            comp = {0: "x", 1: "y", 2: "z"}.get(axis)
+            if comp is None:
+                raise ValueError(f"program_id axis must be 0/1/2, got {axis}")
+            lines.append(f"{indent}uint v{out.id} = tgpig.{comp};")
             return
         if inst.op == "thread_id":
             out = inst.out
             assert out is not None
             axis = int(inst.args[0])
-            if axis != 0:
-                raise ValueError("only thread_id(0) is supported in MVP")
-            lines.append(f"{indent}uint v{out.id} = tpig.x;")
+            comp = {0: "x", 1: "y", 2: "z"}.get(axis)
+            if comp is None:
+                raise ValueError(f"thread_id axis must be 0/1/2, got {axis}")
+            lines.append(f"{indent}uint v{out.id} = tpig.{comp};")
             return
         if inst.op == "arange":
             out = inst.out
@@ -283,6 +285,15 @@ def ir_to_msl(ir: IRModule) -> tuple[str, int]:
             b: ValueRef
             a, b = inst.args  # type: ignore[misc]
             op = {"add": "+", "mul": "*", "lt": "<"}[inst.op]
+            lines.append(
+                f"{indent}{_msl_type(out.dtype)} v{out.id} = {_ref(ctx, a)} {op} {_ref(ctx, b)};"
+            )
+            return
+        if inst.op in {"floordiv", "mod"}:
+            out = inst.out
+            assert out is not None
+            a, b = inst.args  # type: ignore[misc]
+            op = {"floordiv": "/", "mod": "%"}[inst.op]
             lines.append(
                 f"{indent}{_msl_type(out.dtype)} v{out.id} = {_ref(ctx, a)} {op} {_ref(ctx, b)};"
             )

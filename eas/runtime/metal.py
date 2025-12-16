@@ -12,6 +12,7 @@ import numpy as np
 
 from ..ir import DType, IRModule
 from .metal_ext import load_metal_ext
+from .grid import infer_nthreads
 
 
 def _is_tensor(v: Any) -> bool:
@@ -218,20 +219,27 @@ class MetalRuntime:
         meta: Mapping[str, Any],
         *,
         sync: bool = True,
+        nthreads: int | None = None,
+        grid: tuple[int, int, int] | None = None,
     ) -> None:
         _ = meta
         ir: IRModule = ck.ir
         threadgroup_size: int = ck.threadgroup_size
 
-        if "N" not in runtime_args:
-            raise ValueError(
-                "MVP runtime requires a scalar argument named 'N' for grid sizing"
-            )
-        n = int(runtime_args["N"])
-        if n < 0:
-            raise ValueError("N must be >= 0")
-        if n == 0:
-            return
+        if grid is None:
+            n = infer_nthreads(runtime_args, nthreads=nthreads)
+            if n == 0:
+                return
+            tpg: int | tuple[int, int, int] = int(n)
+            tptg: int | tuple[int, int, int] = int(threadgroup_size)
+        else:
+            gx, gy, gz = map(int, grid)
+            if gx < 0 or gy < 0 or gz < 0:
+                raise ValueError("grid dims must be >= 0")
+            if gx == 0 or gy == 0 or gz == 0:
+                return
+            tpg = (gx * int(threadgroup_size), gy, gz)
+            tptg = (int(threadgroup_size), 1, 1)
         writes = ck.writes
 
         argv, writable, host_copies = self._build_argv(
@@ -240,28 +248,18 @@ class MetalRuntime:
 
         pipeline = self._get_pipeline(ck)
         mod = self._mod()
-        use_thread_count_launch = callable(getattr(mod, "launch_tg", None))
-        grid_or_threads = (
-            int(n)
-            if use_thread_count_launch
-            else (int(n) + int(threadgroup_size) - 1) // int(threadgroup_size)
-        )
         # If we bridged numpy arrays through temporary buffers, we must copy results
         # back to host. Keep this path synchronous for correctness.
         if host_copies:
             sync = True
 
         if sync or not callable(getattr(mod, "launch_async", None)):
-            mod.launch(
-                pipeline, argv, writable, int(grid_or_threads), int(threadgroup_size)
-            )
+            mod.launch(pipeline, argv, writable, tpg, tptg)
             for cap, arr in host_copies:
                 mod.copy_to_host(cap, arr)
             return
 
-        pending = mod.launch_async(
-            pipeline, argv, writable, int(grid_or_threads), int(threadgroup_size)
-        )
+        pending = mod.launch_async(pipeline, argv, writable, tpg, tptg)
         if self._pending is None:
             self._pending = deque()
         self._pending.append(pending)
@@ -286,6 +284,8 @@ class MetalRuntime:
         repeat: int,
         warmup: int = 0,
         torch_mps_sync: bool = False,
+        nthreads: int | None = None,
+        grid: tuple[int, int, int] | None = None,
     ) -> float:
         _ = meta
         if repeat <= 0:
@@ -298,15 +298,20 @@ class MetalRuntime:
         ir: IRModule = ck.ir
         threadgroup_size: int = ck.threadgroup_size
 
-        if "N" not in runtime_args:
-            raise ValueError(
-                "MVP runtime requires a scalar argument named 'N' for grid sizing"
-            )
-        n = int(runtime_args["N"])
-        if n < 0:
-            raise ValueError("N must be >= 0")
-        if n == 0:
-            return 0.0
+        if grid is None:
+            n = infer_nthreads(runtime_args, nthreads=nthreads)
+            if n == 0:
+                return 0.0
+            tpg: int | tuple[int, int, int] = int(n)
+            tptg: int | tuple[int, int, int] = int(threadgroup_size)
+        else:
+            gx, gy, gz = map(int, grid)
+            if gx < 0 or gy < 0 or gz < 0:
+                raise ValueError("grid dims must be >= 0")
+            if gx == 0 or gy == 0 or gz == 0:
+                return 0.0
+            tpg = (gx * int(threadgroup_size), gy, gz)
+            tptg = (int(threadgroup_size), 1, 1)
 
         argv, writable, host_copies = self._build_argv(
             ir, runtime_args, ck.writes, torch_mps_sync=torch_mps_sync
@@ -318,12 +323,6 @@ class MetalRuntime:
             )
         pipeline = self._get_pipeline(ck)
         mod = self._mod()
-        use_thread_count_launch = callable(getattr(mod, "launch_tg", None))
-        grid_or_threads = (
-            int(n)
-            if use_thread_count_launch
-            else (int(n) + int(threadgroup_size) - 1) // int(threadgroup_size)
-        )
 
         if warmup:
             try:
@@ -331,8 +330,8 @@ class MetalRuntime:
                     pipeline,
                     argv,
                     writable,
-                    int(grid_or_threads),
-                    int(threadgroup_size),
+                    tpg,
+                    tptg,
                     int(warmup),
                 )
             except TypeError:
@@ -341,8 +340,8 @@ class MetalRuntime:
                         pipeline,
                         argv,
                         writable,
-                        int(grid_or_threads),
-                        int(threadgroup_size),
+                        tpg,
+                        tptg,
                     )
 
         t0 = time.perf_counter()
@@ -351,8 +350,8 @@ class MetalRuntime:
                 pipeline,
                 argv,
                 writable,
-                int(grid_or_threads),
-                int(threadgroup_size),
+                tpg,
+                tptg,
                 int(repeat),
             )
         except TypeError:
@@ -361,8 +360,8 @@ class MetalRuntime:
                     pipeline,
                     argv,
                     writable,
-                    int(grid_or_threads),
-                    int(threadgroup_size),
+                    tpg,
+                    tptg,
                 )
         t1 = time.perf_counter()
         return (t1 - t0) / float(repeat)
