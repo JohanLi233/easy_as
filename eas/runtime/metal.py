@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import struct
 import os
+import time
 import weakref
 from collections import deque
 from dataclasses import dataclass
@@ -11,7 +12,6 @@ import numpy as np
 
 from ..ir import DType, IRModule
 from .metal_ext import load_metal_ext
-from .grid import infer_1d_grid
 
 
 def _is_tensor(v: Any) -> bool:
@@ -121,27 +121,29 @@ class MetalRuntime:
         self._pipeline_cache[key] = pipeline
         return pipeline
 
-    def run(
+    def _torch_mps_sync_enabled(self) -> bool:
+        return os.environ.get("EAS_TORCH_MPS_SYNC", "1").strip().lower() not in (
+            "0",
+            "false",
+            "no",
+            "off",
+        )
+
+    def _build_argv(
         self,
-        ck: Any,
+        ir: IRModule,
         runtime_args: Mapping[str, Any],
-        meta: Mapping[str, Any],
+        writes: set[str] | frozenset[str],
         *,
-        sync: bool = True,
-    ) -> None:
-        _ = meta
-        ir: IRModule = ck.ir
-        threadgroup_size: int = ck.threadgroup_size
-
-        grid = infer_1d_grid(runtime_args, threadgroup_size)
-        writes = ck.writes
-
+        torch_mps_sync: bool | None,
+    ) -> tuple[list[object], list[bool]]:
         argv: list[object] = []
         writable: list[bool] = []
         torch_mod = self._get_torch()
-        torch_mps_sync_enabled = os.environ.get(
-            "EAS_TORCH_MPS_SYNC", "1"
-        ).strip().lower() not in ("0", "false", "no", "off")
+
+        torch_mps_sync_enabled = (
+            self._torch_mps_sync_enabled() if torch_mps_sync is None else torch_mps_sync
+        )
         torch_mps_synced = False
 
         for arg in ir.args:
@@ -167,7 +169,7 @@ class MetalRuntime:
                             f"unsupported torch device for {arg.name!r}: {t.device!s}"
                         )
                 if _is_tensor(v):
-                    if getattr(v, "device", None) == "metal":
+                    if getattr(v, "device", None) in ("mps", "metal"):
                         argv.append(v._metal_buffer())  # type: ignore[attr-defined]
                         writable.append(arg.name in writes)
                         continue
@@ -186,14 +188,51 @@ class MetalRuntime:
                 argv.append(_pack_scalar(arg.dtype, v))
                 writable.append(False)
 
+        return argv, writable
+
+    def run(
+        self,
+        ck: Any,
+        runtime_args: Mapping[str, Any],
+        meta: Mapping[str, Any],
+        *,
+        sync: bool = True,
+    ) -> None:
+        _ = meta
+        ir: IRModule = ck.ir
+        threadgroup_size: int = ck.threadgroup_size
+
+        if "N" not in runtime_args:
+            raise ValueError(
+                "MVP runtime requires a scalar argument named 'N' for grid sizing"
+            )
+        n = int(runtime_args["N"])
+        if n < 0:
+            raise ValueError("N must be >= 0")
+        if n == 0:
+            return
+        writes = ck.writes
+
+        argv, writable = self._build_argv(
+            ir, runtime_args, writes, torch_mps_sync=None
+        )
+
         pipeline = self._get_pipeline(ck)
         mod = self._mod()
+        use_thread_count_launch = callable(getattr(mod, "launch_tg", None))
+        grid_or_threads = (
+            int(n)
+            if use_thread_count_launch
+            else (int(n) + int(threadgroup_size) - 1) // int(threadgroup_size)
+        )
         if sync or not callable(getattr(mod, "launch_async", None)):
-            mod.launch(pipeline, argv, writable, int(grid), int(threadgroup_size))
+            mod.launch(
+                pipeline, argv, writable, int(grid_or_threads), int(threadgroup_size)
+            )
             return
 
         pending = mod.launch_async(
-            pipeline, argv, writable, int(grid), int(threadgroup_size)
+            pipeline, argv, writable, int(grid_or_threads), int(threadgroup_size)
         )
         if self._pending is None:
             self._pending = deque()
@@ -209,3 +248,88 @@ class MetalRuntime:
         mod = self._mod()
         while pending:
             mod.synchronize(pending.popleft())
+
+    def benchmark(
+        self,
+        ck: Any,
+        runtime_args: Mapping[str, Any],
+        meta: Mapping[str, Any],
+        *,
+        repeat: int,
+        warmup: int = 0,
+        torch_mps_sync: bool = False,
+    ) -> float:
+        _ = meta
+        if repeat <= 0:
+            raise ValueError("repeat must be > 0")
+        if warmup < 0:
+            raise ValueError("warmup must be >= 0")
+
+        self.synchronize()
+
+        ir: IRModule = ck.ir
+        threadgroup_size: int = ck.threadgroup_size
+
+        if "N" not in runtime_args:
+            raise ValueError(
+                "MVP runtime requires a scalar argument named 'N' for grid sizing"
+            )
+        n = int(runtime_args["N"])
+        if n < 0:
+            raise ValueError("N must be >= 0")
+        if n == 0:
+            return 0.0
+
+        argv, writable = self._build_argv(
+            ir, runtime_args, ck.writes, torch_mps_sync=torch_mps_sync
+        )
+        pipeline = self._get_pipeline(ck)
+        mod = self._mod()
+        use_thread_count_launch = callable(getattr(mod, "launch_tg", None))
+        grid_or_threads = (
+            int(n)
+            if use_thread_count_launch
+            else (int(n) + int(threadgroup_size) - 1) // int(threadgroup_size)
+        )
+
+        if warmup:
+            try:
+                mod.launch(
+                    pipeline,
+                    argv,
+                    writable,
+                    int(grid_or_threads),
+                    int(threadgroup_size),
+                    int(warmup),
+                )
+            except TypeError:
+                for _ in range(warmup):
+                    mod.launch(
+                        pipeline,
+                        argv,
+                        writable,
+                        int(grid_or_threads),
+                        int(threadgroup_size),
+                    )
+
+        t0 = time.perf_counter()
+        try:
+            mod.launch(
+                pipeline,
+                argv,
+                writable,
+                int(grid_or_threads),
+                int(threadgroup_size),
+                int(repeat),
+            )
+        except TypeError:
+            for _ in range(repeat):
+                mod.launch(
+                    pipeline,
+                    argv,
+                    writable,
+                    int(grid_or_threads),
+                    int(threadgroup_size),
+                )
+        t1 = time.perf_counter()
+        return (t1 - t0) / float(repeat)

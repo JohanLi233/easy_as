@@ -10,7 +10,7 @@ def load_metal_ext(*, require: bool) -> Any | None:
     if spec is None:
         if require:
             raise RuntimeError(
-                "Metal backend is not built. Run `python3 tools/build_metal_ext.py` "
+                "Metal backend is not built. Run `uv run python tools/build_metal_ext.py` "
                 "to build `eas._metal`, or set `EAS_BACKEND=cpu` to use CPU fallback."
             )
         return None
@@ -35,6 +35,6 @@ def load_metal_ext(*, require: bool) -> Any | None:
         raise RuntimeError(
             "Metal extension `eas._metal` is missing required API: "
             + ", ".join(missing)
-            + ". Rebuild it with `python3 tools/build_metal_ext.py`."
+            + ". Rebuild it with `uv run python tools/build_metal_ext.py`."
         )
     return mod

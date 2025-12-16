@@ -26,15 +26,15 @@ easy_as 是一个 Python 优先的内核框架，具有小型追踪 DSL，可降
 - **运行时后端**：`eas/runtime/*`
   - `eas/runtime/metal.py`：通过 `eas._metal`（ObjC++）在 Metal 上执行 `CompiledKernel`。
   - `eas/runtime/cpu.py`：用于正确性和测试的 CPU 回退。
-  - `eas/runtime/__init__.py`：运行时选择（`EAS_BACKEND=auto|cpu|metal`）。
+  - `eas/runtime/__init__.py`：运行时选择（`EAS_BACKEND=auto|cpu|mps`；`metal` 为兼容别名）。
 
 ### 设备张量（torch风格）
 
 `eas/tensor.py` 引入类似 torch 的 `eas.Tensor` 作为长期数据模型：
 
-- `eas.tensor(data, device="cpu"|"metal")`
+- `eas.tensor(data, device="cpu"|"mps")`
 - `eas.empty(shape, device=...)`、`eas.empty_like(t)`
-- `t.to("cpu"|"metal")`、`t.numpy()`
+- `t.to("cpu"|"mps")`、`t.numpy()`
 
 设计原理：
 
@@ -51,7 +51,7 @@ easy_as 是一个 Python 优先的内核框架，具有小型追踪 DSL，可降
 架构设计为与 PyTorch 互操作，而不将核心编译耦合到 torch 内部：
 
 - **CPU**：`torch.Tensor` ↔ `eas.Tensor(device="cpu")` 在可能时通过 `tensor.numpy()` / `torch.from_numpy(...)` 实现零拷贝。
-- **GPU/Metal**：对于 contiguous float32，`torch(mps)` ↔ `eas(metal)` 可通过 DLPack(kDLMetal) 做到零拷贝互操作；将 DLPack 视为互操作边界（可能隐含同步）以保证企业级正确性。
+- **GPU/MPS**：对于 contiguous float32，`torch(mps)` ↔ `eas(mps)` 可通过 DLPack(kDLMetal) 做到零拷贝互操作；将 DLPack 视为互操作边界（可能隐含同步）以保证企业级正确性。
 
 #### DLPack
 

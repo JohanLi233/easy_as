@@ -15,11 +15,13 @@ if TYPE_CHECKING:  # pragma: no cover
     from .metal import MetalRuntime
 
 
-def get_runtime(backend: Literal["auto", "cpu", "metal"] | None = None) -> Runtime:
+def get_runtime(backend: Literal["auto", "cpu", "mps", "metal"] | None = None) -> Runtime:
     backend = (backend or os.environ.get("EAS_BACKEND", "auto")).lower()
+    if backend == "metal":
+        backend = "mps"
     if backend == "cpu":
         return _cpu
-    if backend == "metal":
+    if backend == "mps":
         return _get_metal()
     if backend == "auto":
         try:
@@ -30,7 +32,7 @@ def get_runtime(backend: Literal["auto", "cpu", "metal"] | None = None) -> Runti
             pass
         return _cpu
     raise ValueError(
-        f"unsupported backend: {backend!r} (expected 'auto'|'cpu'|'metal')"
+        f"unsupported backend: {backend!r} (expected 'auto'|'cpu'|'mps')"
     )
 
 

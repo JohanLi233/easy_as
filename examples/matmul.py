@@ -104,16 +104,35 @@ def main(argv: list[str] | None = None) -> None:
         runtime.synchronize()
     if device.type == "mps":
         torch.mps.synchronize()
-    t0 = time.perf_counter()
-    for _ in range(iters):
-        matmul_kernel(a, b, c, n_total, BLOCK=block, K=k, _sync=False)
-    if hasattr(runtime, "synchronize"):
-        runtime.synchronize()
-    if device.type == "mps":
-        torch.mps.synchronize()
-    t1 = time.perf_counter()
-    eas_ms = (t1 - t0) * 1e3 / iters
-    print(f"time: {eas_ms:.3f} ms/iter (iters={iters})")
+
+    eas_ms: float
+    eas_mode: str
+    if runtime_name == "MetalRuntime" and callable(getattr(runtime, "benchmark", None)):
+        ck = matmul_kernel.compile(a, b, c, n_total, BLOCK=block, K=k)
+        warmup = min(5, iters)
+        t = runtime.benchmark(
+            ck,
+            {"a": a, "b": b, "c": c, "N": n_total},
+            {"BLOCK": block, "K": k},
+            repeat=iters,
+            warmup=warmup,
+            torch_mps_sync=False,
+        )
+        eas_ms = t * 1e3
+        eas_mode = "single-cb repeat"
+    else:
+        t0 = time.perf_counter()
+        for _ in range(iters):
+            matmul_kernel(a, b, c, n_total, BLOCK=block, K=k, _sync=False)
+        if hasattr(runtime, "synchronize"):
+            runtime.synchronize()
+        if device.type == "mps":
+            torch.mps.synchronize()
+        t1 = time.perf_counter()
+        eas_ms = (t1 - t0) * 1e3 / iters
+        eas_mode = "loop"
+
+    print(f"time: {eas_ms:.3f} ms/iter (iters={iters}, mode={eas_mode})")
 
     warmup = min(20, iters)
     for _ in range(warmup):

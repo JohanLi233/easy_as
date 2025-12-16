@@ -62,12 +62,12 @@ class TestTorchInterop(unittest.TestCase):
 
         from eas.runtime import get_runtime
 
-        rt = get_runtime("metal")
+        rt = get_runtime("mps")
         if not rt.is_available():
-            self.skipTest("Metal runtime is not available")
+            self.skipTest("MPS runtime is not available")
 
         old = os.environ.get("EAS_BACKEND")
-        os.environ["EAS_BACKEND"] = "metal"
+        os.environ["EAS_BACKEND"] = "mps"
         try:
             n = 4096 + 3
             a = torch.randn(n, device="mps", dtype=torch.float32)

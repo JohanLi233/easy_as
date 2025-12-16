@@ -8,7 +8,7 @@ from .tensor import Tensor, _MetalStorage, _normalize_device, tensor as _tensor
 from .runtime.metal_ext import load_metal_ext
 
 
-Device = Literal["cpu", "metal"]
+Device = Literal["cpu", "mps"]
 
 
 def from_dlpack(x: Any, *, device: Device | str | None = None) -> Tensor:
@@ -17,11 +17,11 @@ def from_dlpack(x: Any, *, device: Device | str | None = None) -> Tensor:
 
     Notes
     - CPU: zero-copy is possible via `numpy.from_dlpack(...)`.
-    - Metal: supported when the producer exports a `kDLMetal` DLPack tensor (e.g. torch(mps)).
+    - MPS: supported when the producer exports a `kDLMetal` DLPack tensor (e.g. torch(mps)).
     """
     device_n = _normalize_device(device)
 
-    if device_n == "metal":
+    if device_n == "mps":
         mod = load_metal_ext(require=True)
         capsule = x
         if type(capsule).__name__ != "PyCapsule":
@@ -37,7 +37,7 @@ def from_dlpack(x: Any, *, device: Device | str | None = None) -> Tensor:
         return Tensor(
             shape=shape_t,
             dtype=np.float32,
-            device="metal",
+            device="mps",
             metal=_MetalStorage(buf=buf, nbytes=nbytes, storage="private"),
         )
 

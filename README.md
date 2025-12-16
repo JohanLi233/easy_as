@@ -29,15 +29,15 @@ print(add_kernel.to_msl(a, b, c, n, BLOCK=256))
 
 ## 设备张量（torch风格）
 
-为了在 Metal 上获得性能，请将缓冲区保留在设备上：
+为了在 GPU 上获得性能，请将缓冲区保留在设备上（推荐用 `eas.Tensor(device="mps")` 或 torch(MPS)）：
 
 ```python
 import numpy as np
 import eas
 
 n = 1 << 20
-a = eas.tensor(np.random.randn(n).astype(np.float32), device="metal")
-b = eas.tensor(np.random.randn(n).astype(np.float32), device="metal")
+a = eas.tensor(np.random.randn(n).astype(np.float32), device="mps")
+b = eas.tensor(np.random.randn(n).astype(np.float32), device="mps")
 c = eas.empty_like(a)
 
 add_kernel(a, b, c, n, BLOCK=256)
@@ -47,13 +47,13 @@ out = c.numpy()
 运行示例：
 
 ```bash
-uv run python examples/add.py
+uv run python -m examples.add
 ```
 
 运行测试：
 
 ```bash
-uv run pytest tests/
+uv run python -m unittest discover -s tests -p "test*.py" -v
 ```
 
 ## Metal 后端（GPU）
@@ -67,7 +67,7 @@ uv run python tools/build_metal_ext.py
 使用 Metal 运行：
 
 ```bash
-EAS_BACKEND=metal uv run python examples/add.py
+EAS_BACKEND=mps uv run python -m examples.add
 ```
 
 ## Torch 互操作
@@ -80,17 +80,17 @@ import eas
 
 a = torch.randn(1024, device="cpu", dtype=torch.float32)
 a_e = eas.tensor(a, device="cpu")  # CPU 上的零拷贝
-b_e = a_e.to("metal")              # 上传到 Metal（拷贝）
+b_e = a_e.to("mps")               # 上传到 MPS（拷贝）
 
-# MPS → Metal：通过 DLPack(kDLMetal) 零拷贝（需 contiguous float32）
+# MPS → eas(mps)：通过 DLPack(kDLMetal) 零拷贝（需 contiguous float32）
 x = torch.randn(1024, device="mps", dtype=torch.float32)
-x_e = eas.tensor(x, device="metal")
+x_e = eas.tensor(x, device="mps")
 ```
 
 转换回去：
 
 ```python
-t = x_e.to_torch("mps")            # Metal → MPS：DLPack 零拷贝
+t = x_e.to_torch("mps")            # eas(mps) → torch(mps)：DLPack 零拷贝
 ```
 
 ## DLPack 互操作
@@ -110,7 +110,7 @@ z = eas.to_dlpack(y)               # DLPack 胶囊（CPU；torch 风格）
 
 ### 环境变量
 
-- `EAS_BACKEND=auto|cpu|metal`：选择后端
+- `EAS_BACKEND=auto|cpu|mps`：选择后端
 - `EAS_MAX_IN_FLIGHT`：最大异步启动数量（在使用 `_sync=False` 调用内核时使用）
 
 ### 使用 uv
@@ -122,14 +122,14 @@ z = eas.to_dlpack(y)               # DLPack 胶囊（CPU；torch 风格）
 uv sync --dev
 
 # 运行示例
-uv run python examples/add.py
+uv run python -m examples.add
 
 # 运行测试
-uv run pytest tests/
+uv run python -m unittest discover -s tests -p "test*.py" -v
 
 # 激活虚拟环境（在当前shell中）
 source .venv/bin/activate
-python examples/add.py
+python -m examples.add
 ```
 
 ## 文档

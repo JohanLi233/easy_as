@@ -9,7 +9,8 @@ import numpy as np
 
 from .runtime.metal_ext import load_metal_ext
 
-Device = Literal["cpu", "metal"]
+# Public API: use "mps" (Apple GPU) rather than the implementation detail "metal".
+Device = Literal["cpu", "mps"]
 
 
 def _torch() -> Any | None:
@@ -31,9 +32,11 @@ def _is_torch_tensor(x: Any) -> bool:
 def _normalize_device(device: str | None) -> Device:
     if device is None:
         return "cpu"
-    device_l = device.lower()
-    if device_l not in ("cpu", "metal"):
-        raise ValueError(f"unsupported device: {device!r} (expected 'cpu'|'metal')")
+    device_l = str(device).lower()
+    if device_l == "metal":
+        device_l = "mps"
+    if device_l not in ("cpu", "mps"):
+        raise ValueError(f"unsupported device: {device!r} (expected 'cpu'|'mps')")
     return device_l  # type: ignore[return-value]
 
 
@@ -85,9 +88,9 @@ class Tensor:
                 raise ValueError("cpu tensor cannot have metal storage")
         else:
             if self._metal is None:
-                raise ValueError("metal tensor requires metal storage")
+                raise ValueError("mps tensor requires metal storage")
             if self._cpu is not None:
-                raise ValueError("metal tensor cannot have cpu storage")
+                raise ValueError("mps tensor cannot have cpu storage")
 
     @property
     def device(self) -> Device:
@@ -110,7 +113,7 @@ class Tensor:
 
     def __array__(self, dtype: Any | None = None) -> np.ndarray:
         if self._device != "cpu":
-            raise TypeError("cannot convert a metal tensor to numpy without .numpy()")
+            raise TypeError("cannot convert a mps tensor to numpy without .numpy()")
         arr = self._cpu
         assert arr is not None
         if dtype is None:
@@ -129,7 +132,7 @@ class Tensor:
         if not callable(getattr(mod, "dlpack_export", None)):
             raise RuntimeError(
                 "Metal extension `eas._metal` is missing DLPack export API; rebuild it with "
-                "`python3 tools/build_metal_ext.py`."
+                "`uv run python tools/build_metal_ext.py`."
             )
         return mod.dlpack_export(metal.buf, self._shape)
 
@@ -151,7 +154,7 @@ class Tensor:
         if not callable(getattr(mod, "copy_to_host", None)):
             raise RuntimeError(
                 "Metal extension `eas._metal` is missing tensor copy API; rebuild it with "
-                "`python3 tools/build_metal_ext.py`."
+                "`uv run python tools/build_metal_ext.py`."
             )
         out = np.empty(self._shape, dtype=self._dtype)
         mod.copy_to_host(metal.buf, out)
@@ -173,7 +176,7 @@ class Tensor:
         if device_l == "cpu":
             return torch.from_numpy(self.numpy())
 
-        if self._device == "metal":
+        if self._device == "mps":
             from torch.utils import dlpack  # type: ignore
 
             return dlpack.from_dlpack(self)
@@ -189,19 +192,19 @@ class Tensor:
                 shape=self._shape, dtype=self._dtype, device="cpu", cpu=self.numpy()
             )
 
-        # cpu -> metal
+        # cpu -> mps (Metal backend)
         mod = load_metal_ext(require=True)
         if not callable(getattr(mod, "alloc_buffer", None)) or not callable(
             getattr(mod, "copy_from_host", None)
         ):
             raise RuntimeError(
                 "Metal extension `eas._metal` is missing tensor allocation/copy API; rebuild it with "
-                "`python3 tools/build_metal_ext.py`."
+                "`uv run python tools/build_metal_ext.py`."
             )
         if not callable(getattr(mod, "is_available", None)) or not bool(
             mod.is_available()
         ):
-            raise RuntimeError("Metal device is not available")
+            raise RuntimeError("MPS device is not available")
 
         buf = mod.alloc_buffer(int(self.nbytes), "private")
         arr = self._cpu
@@ -210,13 +213,13 @@ class Tensor:
         return Tensor(
             shape=self._shape,
             dtype=self._dtype,
-            device="metal",
+            device="mps",
             metal=_MetalStorage(buf=buf, nbytes=self.nbytes, storage="private"),
         )
 
     def _metal_buffer(self) -> object:
-        if self._device != "metal":
-            raise TypeError("expected a metal tensor")
+        if self._device not in ("mps", "metal"):
+            raise TypeError("expected an mps tensor")
         metal = self._metal
         assert metal is not None
         return metal.buf
@@ -248,7 +251,7 @@ def tensor(
         if t.dtype != torch.float32:
             t = t.to(dtype=torch.float32)
 
-        if device_n == "metal" and t.device.type == "mps":
+        if device_n == "mps" and t.device.type == "mps":
             if os.environ.get("EAS_TORCH_MPS_SYNC", "1").strip().lower() not in (
                 "0",
                 "false",
@@ -262,7 +265,7 @@ def tensor(
             if not callable(getattr(mod, "dlpack_import", None)):
                 raise RuntimeError(
                     "Metal extension `eas._metal` is missing DLPack import API; rebuild it with "
-                    "`python3 tools/build_metal_ext.py`."
+                    "`uv run python tools/build_metal_ext.py`."
                 )
             cap = t.__dlpack__()
             buf, shape = mod.dlpack_import(cap)
@@ -271,7 +274,7 @@ def tensor(
             return Tensor(
                 shape=shape_t,
                 dtype=np.float32,
-                device="metal",
+                device="mps",
                 metal=_MetalStorage(buf=buf, nbytes=nbytes, storage="private"),
             )
 
@@ -323,16 +326,16 @@ def empty(
     if not callable(getattr(mod, "alloc_buffer", None)):
         raise RuntimeError(
             "Metal extension `eas._metal` is missing tensor allocation API; rebuild it with "
-            "`python3 tools/build_metal_ext.py`."
+            "`uv run python tools/build_metal_ext.py`."
         )
     if not callable(getattr(mod, "is_available", None)) or not bool(mod.is_available()):
-        raise RuntimeError("Metal device is not available")
+        raise RuntimeError("MPS device is not available")
     nbytes = _numel(shape_t) * int(dtype_n.itemsize)
     buf = mod.alloc_buffer(int(nbytes), "private")
     return Tensor(
         shape=shape_t,
         dtype=dtype_n,
-        device="metal",
+        device="mps",
         metal=_MetalStorage(buf=buf, nbytes=nbytes, storage="private"),
     )
 

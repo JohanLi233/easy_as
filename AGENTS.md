@@ -8,17 +8,17 @@
   - `eas/ir.py`：最小化、Metal无关的 IR
   - `eas/codegen/msl.py`：IR → Metal Shading Language (MSL) 代码生成（1D MVP）
   - `eas/runtime/`：后端（`cpu.py`、`metal.py`）和 ObjC++ 扩展源码（`_metal.mm`）
-- `examples/`：可运行的演示（如 `python3 -m examples.add`）
+- `examples/`：可运行的演示（如 `uv run python -m examples.add`）
 - `tests/`：单元测试（`unittest`）
 - `tools/`：开发者脚本（如 `tools/build_metal_ext.py`）
 
 ## 构建、测试和开发命令
 
-- `python3 -m unittest discover -s tests -p "test*.py" -v`：运行测试套件
-- `python3 -m examples.add`：运行元素级加法演示（使用 `EAS_BACKEND=auto`）
-- `python3 tools/build_metal_ext.py`：构建 ObjC++ 扩展 `eas._metal`（需要 macOS + Xcode SDK）
-- `EAS_BACKEND=metal python3 -m examples.add`：强制使用 Metal 运行时
-- `EAS_BACKEND=cpu python3 -m examples.add`：强制使用 CPU 运行时
+- `uv run python -m unittest discover -s tests -p "test*.py" -v`：运行测试套件
+- `uv run python -m examples.add`：运行元素级加法演示（使用 `EAS_BACKEND=auto`）
+- `uv run python tools/build_metal_ext.py`：构建 ObjC++ 扩展 `eas._metal`（需要 macOS + Xcode SDK）
+- `EAS_BACKEND=mps uv run python -m examples.add`：强制使用 Metal 运行时（`metal` 为兼容别名）
+- `EAS_BACKEND=cpu uv run python -m examples.add`：强制使用 CPU 运行时
 
 ## 编码风格与命名约定
 

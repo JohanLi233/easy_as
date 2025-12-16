@@ -20,7 +20,7 @@
   - 此路径稳定且推荐用于企业互操作。
 
 - **Metal/MPS**
-  - 对于 **contiguous 的 float32**，`torch.Tensor(mps)` ↔ `eas.Tensor(metal)` 可通过 **DLPack(kDLMetal)** 做到零拷贝互操作（例如 torch 2.9.1 已支持）。
+  - 对于 **contiguous 的 float32**，`torch.Tensor(mps)` ↔ `eas.Tensor(mps)` 可通过 **DLPack(kDLMetal)** 做到零拷贝互操作（例如 torch 2.9.1 已支持）。
   - 调度语义仍需谨慎：跨框架的队列/流排序并不自动等价于“同一个 stream”，因此将 DLPack 视为**互操作边界**是企业默认策略。
     - easy_as 默认在使用 torch(mps) 张量前做一次 `torch.mps.synchronize()`（可用 `EAS_TORCH_MPS_SYNC=0` 关闭），避免读取到 torch 侧尚未完成的写入。
 
@@ -40,7 +40,7 @@
 
 - CPU：使用 DLPack/NumPy 协议（零拷贝）。
 - Metal/MPS：优先使用 DLPack（零拷贝），否则回退到显式拷贝：
-  - `eas.tensor(torch_mps_tensor, device="metal")`（零拷贝，需 contiguous float32）
+  - `eas.tensor(torch_mps_tensor, device="mps")`（零拷贝，需 contiguous float32）
   - `eas_tensor.to_torch("mps")`（零拷贝，需 contiguous float32）
   - 若不满足条件（非 contiguous / dtype 不支持 / 上游不支持 DLPack），则采用显式拷贝路径。
 - 保持核心运行时严格/可预测（避免在 `MetalRuntime.run` 中做不可见的大拷贝；必要时通过清晰的转换 API 完成边界操作）。

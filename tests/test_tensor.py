@@ -37,17 +37,17 @@ class TestTensorCpu(unittest.TestCase):
 
 
 class TestTensorMetal(unittest.TestCase):
-    def test_metal_roundtrip_and_kernel(self) -> None:
-        rt = get_runtime("metal")
+    def test_mps_roundtrip_and_kernel(self) -> None:
+        rt = get_runtime("mps")
         if not rt.is_available():
-            self.skipTest("Metal is not available")
+            self.skipTest("MPS is not available")
 
         n = 4096 + 3
         a_np = np.random.randn(n).astype(np.float32)
         b_np = np.random.randn(n).astype(np.float32)
 
-        a = eas.tensor(a_np, device="metal")
-        b = eas.tensor(b_np, device="metal")
+        a = eas.tensor(a_np, device="mps")
+        b = eas.tensor(b_np, device="mps")
         c = eas.empty_like(a)
         add_kernel(a, b, c, n, BLOCK=256)
         np.testing.assert_allclose(c.numpy(), a_np + b_np)
