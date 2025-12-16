@@ -1,3 +1,5 @@
+# filename: eas/codegen/msl.py
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -226,7 +228,9 @@ def ir_to_msl(ir: IRModule) -> tuple[str, int]:
     for arg in ir.args:
         if arg.kind == "buffer":
             const_kw = "" if arg.name in uses_store else "const "
-            params.append(f"device {const_kw}float* {arg.name} [[buffer({buf_index})]]")
+            params.append(
+                f"device {const_kw}float* __restrict {arg.name} [[buffer({buf_index})]]"
+            )
         else:
             params.append(
                 f"constant {_msl_type(arg.dtype)}& {arg.name} [[buffer({buf_index})]]"

@@ -1,3 +1,5 @@
+# filename: eas/analysis.py
+
 from __future__ import annotations
 
 from .ir import IRModule, ValueRef

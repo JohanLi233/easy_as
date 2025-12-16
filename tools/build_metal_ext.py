@@ -1,3 +1,5 @@
+# filename: tools/build_metal_ext.py
+
 from __future__ import annotations
 
 import pathlib

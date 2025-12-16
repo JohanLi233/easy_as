@@ -1,3 +1,5 @@
+# filename: tests/test_metal_numpy_bridge.py
+
 from __future__ import annotations
 
 import struct

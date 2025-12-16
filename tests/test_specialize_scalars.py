@@ -1,3 +1,5 @@
+# filename: tests/test_specialize_scalars.py
+
 from __future__ import annotations
 
 import os
