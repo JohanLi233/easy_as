@@ -183,6 +183,18 @@ class _IRBuilder:
         self.insts.append(Inst("mul", out.ref, (av.ref, bv.ref)))
         return out
 
+    def fma(self, a: Any, b: Any, c: Any) -> mk.val:
+        av = self._coerce(a)
+        bv = self._coerce(b)
+        cv = self._coerce(c)
+        if av.dtype != bv.dtype or av.dtype != cv.dtype:
+            raise TypeError(
+                f"fma dtype mismatch: {av.dtype} vs {bv.dtype} vs {cv.dtype}"
+            )
+        out = self._new(av.dtype)
+        self.insts.append(Inst("fma", out.ref, (av.ref, bv.ref, cv.ref)))
+        return out
+
     def floordiv(self, a: Any, b: Any) -> mk.val:
         av = self._coerce(a)
         bv = self._coerce(b)
@@ -347,6 +359,7 @@ def compile(
 
 def _optimize_ir(ir: IRModule) -> IRModule:
     ir = _rewrite_thread_id(ir)
+    ir = _fuse_fma(ir)
     ir = _cse_pure(ir)
     ir = _dce(ir)
     return ir
@@ -416,6 +429,86 @@ def _rewrite_thread_id(ir: IRModule) -> IRModule:
     return IRModule(name=ir.name, args=ir.args, insts=tuple(new_insts))
 
 
+def _fuse_fma(ir: IRModule) -> IRModule:
+    # Build mapping from value id to its defining instruction
+    def_by_id: dict[int, Inst] = {}
+    for inst in ir.insts:
+        if inst.out is not None:
+            def_by_id[inst.out.id] = inst
+
+    # Build use counts to check if mul has other users
+    use_counts: dict[int, int] = {}
+    for inst in ir.insts:
+        for arg in inst.args:
+            if isinstance(arg, ValueRef):
+                use_counts[arg.id] = use_counts.get(arg.id, 0) + 1
+
+    new_insts: list[Inst] = []
+    replaced_mul_ids: set[int] = set()
+
+    for inst in ir.insts:
+        # Look for add(mul(x, y), z) or add(z, mul(x, y))
+        if inst.op == "add" and inst.out is not None:
+            a_ref, b_ref = inst.args  # type: ignore[misc]
+            if not isinstance(a_ref, ValueRef) or not isinstance(b_ref, ValueRef):
+                new_insts.append(inst)
+                continue
+
+            # Try to match mul as first or second argument
+            mul_ref = None
+            other_ref = None
+            for mul_candidate, other_candidate in [(a_ref, b_ref), (b_ref, a_ref)]:
+                mul_inst = def_by_id.get(mul_candidate.id)
+                if (
+                    mul_inst is not None
+                    and mul_inst.op == "mul"
+                    and mul_inst.out is not None
+                ):
+                    mul_ref = mul_candidate
+                    other_ref = other_candidate
+                    break
+
+            if mul_ref is not None and other_ref is not None:
+                mul_inst = def_by_id[mul_ref.id]
+                x_ref, y_ref = mul_inst.args  # type: ignore[misc]
+                if not isinstance(x_ref, ValueRef) or not isinstance(y_ref, ValueRef):
+                    new_insts.append(inst)
+                    continue
+
+                # Check that all operands are float32 (fma only makes sense for float)
+                # Also check that mul result is float32 (should be if inputs are float32)
+                if inst.out.dtype == DType.F32 and mul_inst.out.dtype == DType.F32:
+                    # Check if the mul result has any other users besides this add
+                    # Only fuse if use count is 1 (only this add) to avoid duplicate computation
+                    mul_out_id = mul_inst.out.id
+                    if use_counts.get(mul_out_id, 0) == 1:
+                        replaced_mul_ids.add(mul_out_id)
+                        # Replace with fma(x, y, other)
+                        new_insts.append(
+                            Inst("fma", inst.out, (x_ref, y_ref, other_ref))
+                        )
+                        # Don't add the original add instruction
+                        continue
+                    # If mul has multiple users, keep the original add instruction
+                    # (will be added below)
+
+        new_insts.append(inst)
+
+    # Filter out mul instructions that were replaced and have no other users
+    filtered_insts: list[Inst] = []
+    for inst in new_insts:
+        if (
+            inst.op == "mul"
+            and inst.out is not None
+            and inst.out.id in replaced_mul_ids
+        ):
+            # Skip this mul instruction
+            continue
+        filtered_insts.append(inst)
+
+    return IRModule(name=ir.name, args=ir.args, insts=tuple(filtered_insts))
+
+
 def _cse_pure(ir: IRModule) -> IRModule:
     id_to_ref: dict[int, ValueRef] = {}
     value_numbering: dict[tuple[object, ...], ValueRef] = {}
@@ -452,6 +545,14 @@ def _cse_pure(ir: IRModule) -> IRModule:
             assert isinstance(a_ref, ValueRef)
             assert isinstance(b_ref, ValueRef)
             return ("where", out.dtype, c_ref.id, a_ref.id, b_ref.id)
+        if inst.op == "fma":
+            x_ref, y_ref, z_ref = map(_remap_arg, inst.args)
+            assert isinstance(x_ref, ValueRef)
+            assert isinstance(y_ref, ValueRef)
+            assert isinstance(z_ref, ValueRef)
+            # x and y are commutative (multiplication), z is addition
+            x, y = (x_ref, y_ref) if x_ref.id <= y_ref.id else (y_ref, x_ref)
+            return ("fma", out.dtype, x.id, y.id, z_ref.id)
         return None
 
     for inst in ir.insts:

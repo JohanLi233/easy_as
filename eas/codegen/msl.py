@@ -161,6 +161,7 @@ def ir_to_msl(ir: IRModule) -> tuple[str, int]:
                 elif def_inst.op in {
                     "add",
                     "mul",
+                    "fma",
                     "floordiv",
                     "mod",
                     "lt",
@@ -316,6 +317,14 @@ def ir_to_msl(ir: IRModule) -> tuple[str, int]:
             c, a, b = inst.args  # type: ignore[misc]
             lines.append(
                 f"{indent}{_msl_type(out.dtype)} v{out.id} = {_ref(ctx, c)} ? {_ref(ctx, a)} : {_ref(ctx, b)};"
+            )
+            return
+        if inst.op == "fma":
+            out = inst.out
+            assert out is not None
+            x, y, z = inst.args  # type: ignore[misc]
+            lines.append(
+                f"{indent}{_msl_type(out.dtype)} v{out.id} = fma({_ref(ctx, x)}, {_ref(ctx, y)}, {_ref(ctx, z)});"
             )
             return
         if inst.op == "load":

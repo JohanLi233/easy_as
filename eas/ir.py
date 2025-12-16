@@ -29,6 +29,7 @@ Op: TypeAlias = Literal[
     "where",
     "load",
     "store",
+    "fma",
 ]
 
 
@@ -102,7 +103,7 @@ def validate_ir(ir: IRModule) -> None:
             require(inst.out is not None, f"{inst.op} must produce a value")
             continue
 
-        if inst.op in {"add", "mul", "floordiv", "mod", "lt", "where", "load"}:
+        if inst.op in {"add", "mul", "floordiv", "mod", "lt", "where", "load", "fma"}:
             require(inst.out is not None, f"{inst.op} must produce a value")
 
         if inst.op == "store":

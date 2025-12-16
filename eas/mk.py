@@ -88,3 +88,7 @@ def store(buffer: Any, offset: Any, value: Any, mask: Any | None = None) -> None
 
 def where(cond: Any, a: Any, b: Any) -> val:
     return _b().where(cond, a, b)
+
+
+def fma(a: Any, b: Any, c: Any) -> val:
+    return _b().fma(a, b, c)
