@@ -186,14 +186,16 @@ class _IRBuilder:
         self.insts.append(Inst("arange", v.ref, (int(start), int(size))))
         return v
 
-    def alloc_tg(self, size: int) -> mk.val:
+    def alloc_tg(self, size: int, *, dtype: DType = DType.F32) -> mk.val:
         if not isinstance(size, int):
             raise TypeError(
                 "alloc_tg(size) requires a Python int (compile-time constant)"
             )
         if size <= 0:
             raise ValueError("alloc_tg(size) must be > 0")
-        v = self._new(DType.F32)
+        if dtype not in (DType.F16, DType.F32):
+            raise TypeError(f"alloc_tg(dtype=...) must be f16/f32, got {dtype}")
+        v = self._new(dtype)
         self.insts.append(Inst("alloc_tg", v.ref, (int(size),)))
         self._buffer_ids.add(v.ref.id)
         return v
@@ -262,6 +264,32 @@ class _IRBuilder:
         self.insts.append(Inst("lt", out.ref, (av.ref, bv.ref)))
         return out
 
+    def and_(self, a: Any, b: Any) -> mk.val:
+        av = self._coerce(a)
+        bv = self._coerce(b)
+        if av.dtype != DType.BOOL or bv.dtype != DType.BOOL:
+            raise TypeError("and/or/not expect bool operands")
+        out = self._new(DType.BOOL)
+        self.insts.append(Inst("and", out.ref, (av.ref, bv.ref)))
+        return out
+
+    def or_(self, a: Any, b: Any) -> mk.val:
+        av = self._coerce(a)
+        bv = self._coerce(b)
+        if av.dtype != DType.BOOL or bv.dtype != DType.BOOL:
+            raise TypeError("and/or/not expect bool operands")
+        out = self._new(DType.BOOL)
+        self.insts.append(Inst("or", out.ref, (av.ref, bv.ref)))
+        return out
+
+    def not_(self, x: Any) -> mk.val:
+        xv = self._coerce(x)
+        if xv.dtype != DType.BOOL:
+            raise TypeError("and/or/not expect bool operands")
+        out = self._new(DType.BOOL)
+        self.insts.append(Inst("not", out.ref, (xv.ref,)))
+        return out
+
     def where(self, cond: Any, a: Any, b: Any) -> mk.val:
         cv = self._coerce(cond)
         av = self._coerce(a)
@@ -283,6 +311,134 @@ class _IRBuilder:
         out = self._new(dtype)
         self.insts.append(Inst("cast", out.ref, (xv.ref, dtype)))
         return out
+
+    def dot(
+        self,
+        a_buffer: Any,
+        a_base: Any,
+        a_stride: Any,
+        b_buffer: Any,
+        b_base: Any,
+        b_stride: Any,
+        K: Any,
+    ) -> mk.val:
+        if not isinstance(a_buffer, mk.val) or a_buffer.ref.id not in self._buffer_ids:
+            raise TypeError("dot expects a_buffer to be a buffer (arg or alloc_tg)")
+        if not isinstance(b_buffer, mk.val) or b_buffer.ref.id not in self._buffer_ids:
+            raise TypeError("dot expects b_buffer to be a buffer (arg or alloc_tg)")
+        if a_buffer.dtype != DType.F32 or b_buffer.dtype != DType.F32:
+            raise TypeError("dot currently supports float32 buffers only")
+
+        a_base_v = self._coerce(a_base)
+        a_stride_v = self._coerce(a_stride)
+        b_base_v = self._coerce(b_base)
+        b_stride_v = self._coerce(b_stride)
+        k_v = self._coerce(K)
+        for name, v in {
+            "a_base": a_base_v,
+            "a_stride": a_stride_v,
+            "b_base": b_base_v,
+            "b_stride": b_stride_v,
+            "K": k_v,
+        }.items():
+            if v.dtype != DType.U32:
+                raise TypeError(f"dot {name} must be u32, got {v.dtype}")
+
+        out = self._new(DType.F32)
+        self.insts.append(
+            Inst(
+                "dot",
+                out.ref,
+                (
+                    a_buffer.ref,
+                    a_base_v.ref,
+                    a_stride_v.ref,
+                    b_buffer.ref,
+                    b_base_v.ref,
+                    b_stride_v.ref,
+                    k_v.ref,
+                ),
+            )
+        )
+        return out
+
+    def mma_zero(self) -> mk.val:
+        out = self._new(DType.SG_F32_8X8)
+        self.insts.append(Inst("mma_zero", out.ref, ()))
+        return out
+
+    def mma(
+        self,
+        a_buffer: Any,
+        a_base: Any,
+        a_stride: Any,
+        b_buffer: Any,
+        b_base: Any,
+        b_stride: Any,
+        acc: Any,
+    ) -> mk.val:
+        if not isinstance(a_buffer, mk.val) or a_buffer.ref.id not in self._buffer_ids:
+            raise TypeError("mma expects a_buffer to be a buffer (arg or alloc_tg)")
+        if not isinstance(b_buffer, mk.val) or b_buffer.ref.id not in self._buffer_ids:
+            raise TypeError("mma expects b_buffer to be a buffer (arg or alloc_tg)")
+        if a_buffer.dtype not in (DType.F16, DType.F32) or b_buffer.dtype not in (
+            DType.F16,
+            DType.F32,
+        ):
+            raise TypeError("mma currently supports f16/f32 buffers only")
+
+        a_base_v = self._coerce(a_base)
+        a_stride_v = self._coerce(a_stride)
+        b_base_v = self._coerce(b_base)
+        b_stride_v = self._coerce(b_stride)
+        acc_v = self._coerce(acc)
+        for name, v in {
+            "a_base": a_base_v,
+            "a_stride": a_stride_v,
+            "b_base": b_base_v,
+            "b_stride": b_stride_v,
+        }.items():
+            if v.dtype != DType.U32:
+                raise TypeError(f"mma {name} must be u32, got {v.dtype}")
+        if acc_v.dtype != DType.SG_F32_8X8:
+            raise TypeError(f"mma acc must be sg_f32_8x8, got {acc_v.dtype}")
+
+        out = self._new(DType.SG_F32_8X8)
+        self.insts.append(
+            Inst(
+                "mma",
+                out.ref,
+                (
+                    a_buffer.ref,
+                    a_base_v.ref,
+                    a_stride_v.ref,
+                    b_buffer.ref,
+                    b_base_v.ref,
+                    b_stride_v.ref,
+                    acc_v.ref,
+                ),
+            )
+        )
+        return out
+
+    def mma_store(self, buffer: Any, base: Any, stride: Any, frag: Any) -> None:
+        if not isinstance(buffer, mk.val) or buffer.ref.id not in self._buffer_ids:
+            raise TypeError("mma_store(buffer, ...) expects a buffer (arg or alloc_tg)")
+        if buffer.dtype != DType.F32:
+            raise TypeError("mma_store currently supports float32 buffers only")
+
+        base_v = self._coerce(base)
+        stride_v = self._coerce(stride)
+        frag_v = self._coerce(frag)
+        if base_v.dtype != DType.U32:
+            raise TypeError(f"mma_store base must be u32, got {base_v.dtype}")
+        if stride_v.dtype != DType.U32:
+            raise TypeError(f"mma_store stride must be u32, got {stride_v.dtype}")
+        if frag_v.dtype != DType.SG_F32_8X8:
+            raise TypeError(f"mma_store frag must be sg_f32_8x8, got {frag_v.dtype}")
+        self.insts.append(
+            Inst("mma_store", None, (buffer.ref, base_v.ref, stride_v.ref, frag_v.ref))
+        )
 
     def load(self, buffer: Any, offset: Any, mask: Any | None) -> mk.val:
         if not isinstance(buffer, mk.val):
@@ -411,9 +567,149 @@ def compile(
 def _optimize_ir(ir: IRModule) -> IRModule:
     ir = _rewrite_thread_id(ir)
     ir = _fuse_fma(ir)
+    ir = _simplify_bools(ir)
     ir = _cse_pure(ir)
     ir = _dce(ir)
     return ir
+
+
+def _simplify_bools(ir: IRModule) -> IRModule:
+    def_idx: dict[int, int] = {}
+    for i, inst in enumerate(ir.insts):
+        if inst.out is not None:
+            def_idx[inst.out.id] = i
+
+    def _const_bool(ref: ValueRef) -> bool | None:
+        i = def_idx.get(ref.id)
+        if i is None:
+            return None
+        inst = ir.insts[i]
+        if inst.op != "const" or ref.dtype != DType.BOOL:
+            return None
+        if not isinstance(inst.args[0], bool):
+            return None
+        return bool(inst.args[0])
+
+    id_to_ref: dict[int, ValueRef] = {}
+    new_insts: list[Inst] = []
+
+    def _remap(a: Any) -> Any:
+        if isinstance(a, ValueRef):
+            return id_to_ref.get(a.id, a)
+        return a
+
+    def _alias(out: ValueRef, ref: ValueRef) -> None:
+        id_to_ref[out.id] = ref
+
+    for inst in ir.insts:
+        remapped_args = tuple(_remap(a) for a in inst.args)
+
+        if inst.op == "arg":
+            assert inst.out is not None
+            id_to_ref[inst.out.id] = inst.out
+            new_insts.append(Inst(inst.op, inst.out, remapped_args))
+            continue
+
+        if inst.op in {
+            "store",
+            "load",
+            "dot",
+            "mma",
+            "mma_store",
+            "alloc_tg",
+            "barrier",
+        }:
+            if inst.out is not None:
+                id_to_ref[inst.out.id] = inst.out
+            new_insts.append(Inst(inst.op, inst.out, remapped_args))
+            continue
+
+        if inst.out is None:
+            new_insts.append(Inst(inst.op, None, remapped_args))
+            continue
+
+        out = inst.out
+
+        if inst.op == "where" and out.dtype == DType.BOOL:
+            c_ref, a_ref, b_ref = remapped_args  # type: ignore[misc]
+            assert isinstance(c_ref, ValueRef)
+            assert isinstance(a_ref, ValueRef)
+            assert isinstance(b_ref, ValueRef)
+            cb = _const_bool(c_ref)
+            if cb is not None:
+                _alias(out, a_ref if cb else b_ref)
+                continue
+            ab = _const_bool(a_ref)
+            bb = _const_bool(b_ref)
+            if bb is False:
+                # cond ? other : false  ->  cond && other
+                if ab is True:
+                    _alias(out, c_ref)
+                    continue
+                new_insts.append(Inst("and", out, (c_ref, a_ref)))
+                id_to_ref[out.id] = out
+                continue
+            if ab is True and bb is not None:
+                # cond ? true : b  -> cond || b
+                if bb is False:
+                    _alias(out, c_ref)
+                    continue
+                new_insts.append(Inst("or", out, (c_ref, b_ref)))
+                id_to_ref[out.id] = out
+                continue
+            if ab is False and bb is not None:
+                # cond ? false : b  -> (!cond) && b
+                if bb is False:
+                    # always false
+                    new_insts.append(Inst("const", out, (False,)))
+                    id_to_ref[out.id] = out
+                    continue
+                new_insts.append(Inst(inst.op, out, (c_ref, a_ref, b_ref)))
+                id_to_ref[out.id] = out
+                continue
+
+        if inst.op in {"and", "or"}:
+            a_ref, b_ref = remapped_args  # type: ignore[misc]
+            assert isinstance(a_ref, ValueRef)
+            assert isinstance(b_ref, ValueRef)
+            av = _const_bool(a_ref)
+            bv = _const_bool(b_ref)
+            if inst.op == "and":
+                if av is False or bv is False:
+                    new_insts.append(Inst("const", out, (False,)))
+                    id_to_ref[out.id] = out
+                    continue
+                if av is True:
+                    _alias(out, b_ref)
+                    continue
+                if bv is True:
+                    _alias(out, a_ref)
+                    continue
+            else:
+                if av is True or bv is True:
+                    new_insts.append(Inst("const", out, (True,)))
+                    id_to_ref[out.id] = out
+                    continue
+                if av is False:
+                    _alias(out, b_ref)
+                    continue
+                if bv is False:
+                    _alias(out, a_ref)
+                    continue
+
+        if inst.op == "not":
+            (x_ref,) = remapped_args  # type: ignore[misc]
+            assert isinstance(x_ref, ValueRef)
+            xv = _const_bool(x_ref)
+            if xv is not None:
+                new_insts.append(Inst("const", out, (not xv,)))
+                id_to_ref[out.id] = out
+                continue
+
+        new_insts.append(Inst(inst.op, out, remapped_args))
+        id_to_ref[out.id] = out
+
+    return IRModule(name=ir.name, args=ir.args, insts=tuple(new_insts))
 
 
 def _rewrite_thread_id(ir: IRModule) -> IRModule:
@@ -610,6 +906,15 @@ def _cse_pure(ir: IRModule) -> IRModule:
             a_ref, b_ref = (_remap_arg(inst.args[0]), _remap_arg(inst.args[1]))
             assert isinstance(a_ref, ValueRef) and isinstance(b_ref, ValueRef)
             return ("lt", out.dtype, a_ref.id, b_ref.id)
+        if inst.op in {"and", "or"}:
+            a_ref, b_ref = (_remap_arg(inst.args[0]), _remap_arg(inst.args[1]))
+            assert isinstance(a_ref, ValueRef) and isinstance(b_ref, ValueRef)
+            x, y = (a_ref, b_ref) if a_ref.id <= b_ref.id else (b_ref, a_ref)
+            return (inst.op, out.dtype, x.id, y.id)
+        if inst.op == "not":
+            x_ref = _remap_arg(inst.args[0])
+            assert isinstance(x_ref, ValueRef)
+            return ("not", out.dtype, x_ref.id)
         if inst.op == "where":
             c_ref, a_ref, b_ref = map(_remap_arg, inst.args)
             assert isinstance(c_ref, ValueRef)
@@ -641,7 +946,15 @@ def _cse_pure(ir: IRModule) -> IRModule:
             new_insts.append(Inst(inst.op, inst.out, remapped_args))
             continue
 
-        if inst.op in {"store", "load", "alloc_tg", "barrier"}:
+        if inst.op in {
+            "store",
+            "load",
+            "dot",
+            "mma",
+            "mma_store",
+            "alloc_tg",
+            "barrier",
+        }:
             if inst.out is not None:
                 id_to_ref[inst.out.id] = inst.out
             new_insts.append(Inst(inst.op, inst.out, remapped_args))
@@ -694,6 +1007,12 @@ def _dce(ir: IRModule) -> IRModule:
             _mark(off_ref)
             _mark(val_ref)
             _mark(mask_ref)
+        elif inst.op == "mma_store":
+            buf_ref, base_ref, stride_ref, frag_ref = inst.args  # type: ignore[misc]
+            _mark(buf_ref)
+            _mark(base_ref)
+            _mark(stride_ref)
+            _mark(frag_ref)
         elif inst.op == "barrier":
             pass
         elif inst.op == "arange":

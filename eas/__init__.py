@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from .kernel import Kernel, kernel
+from .autotune import Config, autotune
 from .meta import constexpr
 from .dlpack import from_dlpack, to_dlpack
 from .tensor import Tensor, empty, empty_like, tensor
@@ -12,8 +13,10 @@ from .torch import from_torch, to_torch
 from . import mk  # noqa: F401
 
 __all__ = [
+    "Config",
     "Kernel",
     "Tensor",
+    "autotune",
     "constexpr",
     "from_dlpack",
     "empty",

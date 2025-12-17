@@ -9,8 +9,10 @@ from typing import Any, Iterable, Literal, TypeAlias
 
 class DType(str, Enum):
     BOOL = "bool"
+    F16 = "f16"
     F32 = "f32"
     U32 = "u32"
+    SG_F32_8X8 = "sg_f32_8x8"
 
 
 ArgKind: TypeAlias = Literal["buffer", "scalar"]
@@ -30,8 +32,15 @@ Op: TypeAlias = Literal[
     "floordiv",
     "mod",
     "lt",
+    "and",
+    "or",
+    "not",
     "where",
     "cast",
+    "dot",
+    "mma_zero",
+    "mma",
+    "mma_store",
     "load",
     "store",
     "fma",
@@ -146,11 +155,116 @@ def validate_ir(ir: IRModule) -> None:
         if inst.op in {"add", "mul", "floordiv", "mod", "lt", "where", "load", "fma"}:
             require(inst.out is not None, f"{inst.op} must produce a value")
 
+        if inst.op == "and":
+            require(inst.out is not None, "and must produce a value")
+            require(len(inst.args) == 2, f"and expects 2 args, got {len(inst.args)}")
+            a_ref, b_ref = inst.args
+            require(isinstance(a_ref, ValueRef), "and expects ValueRef args")
+            require(isinstance(b_ref, ValueRef), "and expects ValueRef args")
+            require(inst.out.dtype == DType.BOOL, "and output must be bool")
+            require(a_ref.dtype == DType.BOOL, "and lhs must be bool")
+            require(b_ref.dtype == DType.BOOL, "and rhs must be bool")
+            continue
+
+        if inst.op == "or":
+            require(inst.out is not None, "or must produce a value")
+            require(len(inst.args) == 2, f"or expects 2 args, got {len(inst.args)}")
+            a_ref, b_ref = inst.args
+            require(isinstance(a_ref, ValueRef), "or expects ValueRef args")
+            require(isinstance(b_ref, ValueRef), "or expects ValueRef args")
+            require(inst.out.dtype == DType.BOOL, "or output must be bool")
+            require(a_ref.dtype == DType.BOOL, "or lhs must be bool")
+            require(b_ref.dtype == DType.BOOL, "or rhs must be bool")
+            continue
+
+        if inst.op == "not":
+            require(inst.out is not None, "not must produce a value")
+            require(len(inst.args) == 1, f"not expects 1 arg, got {len(inst.args)}")
+            (x_ref,) = inst.args
+            require(isinstance(x_ref, ValueRef), "not expects a ValueRef arg")
+            require(inst.out.dtype == DType.BOOL, "not output must be bool")
+            require(x_ref.dtype == DType.BOOL, "not input must be bool")
+            continue
+
         if inst.op == "cast":
             require(inst.out is not None, "cast must produce a value")
             require(len(inst.args) == 2, f"cast expects 2 args, got {len(inst.args)}")
             require(isinstance(inst.args[0], ValueRef), "cast expects a ValueRef input")
             require(isinstance(inst.args[1], DType), "cast expects a DType target")
+            continue
+
+        if inst.op == "dot":
+            require(inst.out is not None, "dot must produce a value")
+            require(len(inst.args) == 7, f"dot expects 7 args, got {len(inst.args)}")
+            a_buf, a_base, a_stride, b_buf, b_base, b_stride, k_ref = inst.args
+            require(isinstance(a_buf, ValueRef), "dot expects a ValueRef a buffer")
+            require(isinstance(b_buf, ValueRef), "dot expects a ValueRef b buffer")
+            require(isinstance(a_base, ValueRef), "dot expects a ValueRef a_base")
+            require(isinstance(a_stride, ValueRef), "dot expects a ValueRef a_stride")
+            require(isinstance(b_base, ValueRef), "dot expects a ValueRef b_base")
+            require(isinstance(b_stride, ValueRef), "dot expects a ValueRef b_stride")
+            require(isinstance(k_ref, ValueRef), "dot expects a ValueRef K")
+            continue
+
+        if inst.op == "mma_zero":
+            require(inst.out is not None, "mma_zero must produce a value")
+            require(
+                inst.out.dtype == DType.SG_F32_8X8,
+                "mma_zero currently produces sg_f32_8x8 only",
+            )
+            require(
+                len(inst.args) == 0, f"mma_zero expects 0 args, got {len(inst.args)}"
+            )
+            continue
+
+        if inst.op == "mma":
+            require(inst.out is not None, "mma must produce a value")
+            require(len(inst.args) == 7, f"mma expects 7 args, got {len(inst.args)}")
+            a_buf, a_base, a_stride, b_buf, b_base, b_stride, acc = inst.args
+            require(isinstance(a_buf, ValueRef), "mma expects a ValueRef a buffer")
+            require(isinstance(a_base, ValueRef), "mma expects a ValueRef a_base")
+            require(isinstance(a_stride, ValueRef), "mma expects a ValueRef a_stride")
+            require(isinstance(b_buf, ValueRef), "mma expects a ValueRef b buffer")
+            require(isinstance(b_base, ValueRef), "mma expects a ValueRef b_base")
+            require(isinstance(b_stride, ValueRef), "mma expects a ValueRef b_stride")
+            require(isinstance(acc, ValueRef), "mma expects a ValueRef accumulator")
+            require(
+                inst.out.dtype == DType.SG_F32_8X8,
+                "mma currently produces sg_f32_8x8 only",
+            )
+            require(
+                a_buf.dtype in (DType.F16, DType.F32), "mma a buffer must be f16/f32"
+            )
+            require(
+                b_buf.dtype in (DType.F16, DType.F32), "mma b buffer must be f16/f32"
+            )
+            require(a_base.dtype == DType.U32, "mma a_base must be u32")
+            require(a_stride.dtype == DType.U32, "mma a_stride must be u32")
+            require(b_base.dtype == DType.U32, "mma b_base must be u32")
+            require(b_stride.dtype == DType.U32, "mma b_stride must be u32")
+            require(acc.dtype == DType.SG_F32_8X8, "mma accumulator must be sg_f32_8x8")
+            continue
+
+        if inst.op == "mma_store":
+            require(inst.out is None, "mma_store must not produce a value")
+            require(
+                len(inst.args) == 4, f"mma_store expects 4 args, got {len(inst.args)}"
+            )
+            c_buf, c_base, c_stride, frag = inst.args
+            require(
+                isinstance(c_buf, ValueRef), "mma_store expects a ValueRef c buffer"
+            )
+            require(isinstance(c_base, ValueRef), "mma_store expects a ValueRef c_base")
+            require(
+                isinstance(c_stride, ValueRef), "mma_store expects a ValueRef c_stride"
+            )
+            require(isinstance(frag, ValueRef), "mma_store expects a ValueRef fragment")
+            require(c_buf.dtype == DType.F32, "mma_store c buffer must be f32")
+            require(c_base.dtype == DType.U32, "mma_store c_base must be u32")
+            require(c_stride.dtype == DType.U32, "mma_store c_stride must be u32")
+            require(
+                frag.dtype == DType.SG_F32_8X8, "mma_store fragment must be sg_f32_8x8"
+            )
             continue
 
         if inst.op == "store":

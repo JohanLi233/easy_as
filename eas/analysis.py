@@ -19,4 +19,9 @@ def infer_writes(ir: IRModule) -> frozenset[str]:
             name = id_to_name.get(buf_ref.id)
             if name is not None:
                 writes.add(name)
+        elif inst.op == "mma_store":
+            buf_ref: ValueRef = inst.args[0]
+            name = id_to_name.get(buf_ref.id)
+            if name is not None:
+                writes.add(name)
     return frozenset(writes)

@@ -11,10 +11,14 @@ from ..ir import DType, IRModule, ValueRef
 def _msl_type(dt: DType) -> str:
     if dt == DType.F32:
         return "float"
+    if dt == DType.F16:
+        return "half"
     if dt == DType.U32:
         return "uint"
     if dt == DType.BOOL:
         return "bool"
+    if dt == DType.SG_F32_8X8:
+        return "simdgroup_float8x8"
     raise ValueError(f"unsupported dtype: {dt}")
 
 
@@ -28,6 +32,18 @@ def _const_literal(v: Any) -> str:
     if isinstance(v, float):
         return f"{v}f"
     raise TypeError(f"unsupported const literal: {type(v)!r}")
+
+
+def _zero_literal(dt: DType) -> str:
+    if dt == DType.F32:
+        return "0.0f"
+    if dt == DType.F16:
+        return "half(0.0f)"
+    if dt == DType.U32:
+        return "0u"
+    if dt == DType.BOOL:
+        return "false"
+    raise ValueError(f"unsupported zero literal dtype: {dt}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,6 +75,9 @@ def ir_to_msl(ir: IRModule) -> tuple[str, int]:
             "threadgroup_barrier",
             "tg_barrier",
             "simdgroup_barrier",
+            "mma_zero",
+            "mma",
+            "mma_store",
         }
         threadgroup_mem_ops = {
             "alloc_tg",
@@ -87,6 +106,11 @@ def ir_to_msl(ir: IRModule) -> tuple[str, int]:
             buf_name = arg_names.get(buf_ref.id)
             if buf_name is not None:
                 uses_store.add(buf_name)
+        elif inst.op == "mma_store":
+            buf_ref: ValueRef = inst.args[0]
+            buf_name = arg_names.get(buf_ref.id)
+            if buf_name is not None:
+                uses_store.add(buf_name)
         elif inst.out is not None:
             def_by_id[inst.out.id] = inst
 
@@ -108,6 +132,16 @@ def ir_to_msl(ir: IRModule) -> tuple[str, int]:
             and isinstance(inst.args[0], bool)
             and bool(inst.args[0]) is expected
         )
+
+    def _const_u32(v: ValueRef) -> int | None:
+        inst = def_by_id.get(v.id)
+        if inst is None or inst.op != "const":
+            return None
+        if not isinstance(inst.args[0], int):
+            return None
+        if v.dtype != DType.U32:
+            return None
+        return int(inst.args[0])
 
     def _lifted_region_by_store_idx() -> dict[int, list[int]]:
         def_idx: dict[int, int] = {}
@@ -244,7 +278,11 @@ def ir_to_msl(ir: IRModule) -> tuple[str, int]:
     needs_tpig = False
     needs_lane = False
     needs_sg = False
+    uses_simdgroup_matrix = False
     for inst in ir.insts:
+        if inst.op in {"mma_zero", "mma", "mma_store"}:
+            uses_simdgroup_matrix = True
+            needs_lane = True
         if inst.out is None:
             continue
         if use_counts.get(inst.out.id, 0) == 0:
@@ -264,6 +302,8 @@ def ir_to_msl(ir: IRModule) -> tuple[str, int]:
 
     lines: list[str] = []
     lines.append("#include <metal_stdlib>")
+    if uses_simdgroup_matrix:
+        lines.append("#include <metal_simdgroup_matrix>")
     lines.append("using namespace metal;")
     lines.append("")
     lines.append(f"kernel void {ir.name}(")
@@ -401,6 +441,21 @@ def ir_to_msl(ir: IRModule) -> tuple[str, int]:
                 f"{indent}{_msl_type(out.dtype)} v{out.id} = {_ref(ctx, c)} ? {_ref(ctx, a)} : {_ref(ctx, b)};"
             )
             return
+        if inst.op in {"and", "or"}:
+            out = inst.out
+            assert out is not None
+            a, b = inst.args  # type: ignore[misc]
+            op = "&&" if inst.op == "and" else "||"
+            lines.append(
+                f"{indent}bool v{out.id} = ({_ref(ctx, a)} {op} {_ref(ctx, b)});"
+            )
+            return
+        if inst.op == "not":
+            out = inst.out
+            assert out is not None
+            (x,) = inst.args  # type: ignore[misc]
+            lines.append(f"{indent}bool v{out.id} = !{_ref(ctx, x)};")
+            return
         if inst.op == "cast":
             out = inst.out
             assert out is not None
@@ -424,25 +479,114 @@ def ir_to_msl(ir: IRModule) -> tuple[str, int]:
             assert out is not None
             buf_ref, off_ref, mask_ref = inst.args  # type: ignore[misc]
             buf_name = _ref(ctx, buf_ref)
+            out_ty = _msl_type(out.dtype)
+            zero = _zero_literal(out.dtype)
 
             if in_guard_for_mask is not None and mask_ref.id == in_guard_for_mask.id:
                 lines.append(
-                    f"{indent}float v{out.id} = {buf_name}[{_ref(ctx, off_ref)}];"
+                    f"{indent}{out_ty} v{out.id} = {buf_name}[{_ref(ctx, off_ref)}];"
                 )
             elif _is_const_bool(mask_ref, True):
                 lines.append(
-                    f"{indent}float v{out.id} = {buf_name}[{_ref(ctx, off_ref)}];"
+                    f"{indent}{out_ty} v{out.id} = {buf_name}[{_ref(ctx, off_ref)}];"
                 )
             else:
-                lines.append(f"{indent}float v{out.id} = 0.0f;")
+                lines.append(f"{indent}{out_ty} v{out.id} = {zero};")
                 lines.append(
                     f"{indent}if ({_ref(ctx, mask_ref)}) {{ v{out.id} = {buf_name}[{_ref(ctx, off_ref)}]; }}"
                 )
             return
+        if inst.op == "dot":
+            out = inst.out
+            assert out is not None
+            (
+                a_buf,
+                a_base,
+                a_stride,
+                b_buf,
+                b_base,
+                b_stride,
+                k_ref,
+            ) = inst.args  # type: ignore[misc]
+            a_name = _ref(ctx, a_buf)
+            b_name = _ref(ctx, b_buf)
+            k_name = _ref(ctx, k_ref)
+            k_var = f"k{out.id}"
+            lines.append(f"{indent}float v{out.id} = 0.0f;")
+            lines.append(f"{indent}uint a_idx{out.id} = {_ref(ctx, a_base)};")
+            lines.append(f"{indent}uint b_idx{out.id} = {_ref(ctx, b_base)};")
+            k_const = _const_u32(k_ref)
+            if k_const is not None and 1 <= k_const <= 32:
+                lines.append(f"{indent}#pragma clang loop unroll_count({k_const})")
+            lines.append(
+                f"{indent}for (uint {k_var} = 0; {k_var} < {k_name}; ++{k_var}) {{"
+            )
+            lines.append(
+                f"{indent}  v{out.id} = fma({a_name}[a_idx{out.id}], {b_name}[b_idx{out.id}], v{out.id});"
+            )
+            lines.append(
+                f"{indent}  a_idx{out.id} += {_ref(ctx, a_stride)}; b_idx{out.id} += {_ref(ctx, b_stride)};"
+            )
+            lines.append(f"{indent}}}")
+            return
+        if inst.op == "mma_zero":
+            out = inst.out
+            assert out is not None
+            lines.append(
+                f"{indent}{_msl_type(out.dtype)} v{out.id} = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);"
+            )
+            return
+        if inst.op == "mma":
+            out = inst.out
+            assert out is not None
+            (
+                a_buf,
+                a_base,
+                a_stride,
+                b_buf,
+                b_base,
+                b_stride,
+                acc,
+            ) = inst.args  # type: ignore[misc]
+            a_mat = (
+                "simdgroup_half8x8"
+                if a_buf.dtype == DType.F16
+                else "simdgroup_float8x8"
+            )
+            b_mat = (
+                "simdgroup_half8x8"
+                if b_buf.dtype == DType.F16
+                else "simdgroup_float8x8"
+            )
+            a_tmp = f"v{out.id}_a"
+            b_tmp = f"v{out.id}_b"
+            lines.append(f"{indent}{a_mat} {a_tmp};")
+            lines.append(f"{indent}{b_mat} {b_tmp};")
+            lines.append(
+                f"{indent}simdgroup_load({a_tmp}, {_ref(ctx, a_buf)} + {_ref(ctx, a_base)}, {_ref(ctx, a_stride)});"
+            )
+            lines.append(
+                f"{indent}simdgroup_load({b_tmp}, {_ref(ctx, b_buf)} + {_ref(ctx, b_base)}, {_ref(ctx, b_stride)});"
+            )
+            lines.append(f"{indent}{_msl_type(out.dtype)} v{out.id};")
+            lines.append(
+                f"{indent}simdgroup_multiply_accumulate(v{out.id}, {a_tmp}, {b_tmp}, {_ref(ctx, acc)});"
+            )
+            return
+        if inst.op == "mma_store":
+            c_buf, c_base, c_stride, frag = inst.args  # type: ignore[misc]
+            lines.append(
+                f"{indent}simdgroup_store({_ref(ctx, frag)}, {_ref(ctx, c_buf)} + {_ref(ctx, c_base)}, {_ref(ctx, c_stride)});"
+            )
+            return
         if inst.op == "store":
             buf_ref, off_ref, val_ref, mask_ref = inst.args  # type: ignore[misc]
             buf_name = _ref(ctx, buf_ref)
-            if in_guard_for_mask is not None and mask_ref.id == in_guard_for_mask.id:
+            if _is_const_bool(mask_ref, True):
+                lines.append(
+                    f"{indent}{buf_name}[{_ref(ctx, off_ref)}] = {_ref(ctx, val_ref)};"
+                )
+            elif in_guard_for_mask is not None and mask_ref.id == in_guard_for_mask.id:
                 lines.append(
                     f"{indent}{buf_name}[{_ref(ctx, off_ref)}] = {_ref(ctx, val_ref)};"
                 )
@@ -456,21 +600,116 @@ def ir_to_msl(ir: IRModule) -> tuple[str, int]:
             return
         raise ValueError(f"unsupported op: {inst.op}")
 
-    for idx, inst in enumerate(ir.insts):
+    def _emit_dot_group(start_idx: int, *, indent: str) -> int:
+        inst0 = ir.insts[start_idx]
+        assert inst0.op == "dot"
+        assert inst0.out is not None
+        (
+            a_buf0,
+            a_base0,
+            a_stride0,
+            b_buf0,
+            _b_base0,
+            b_stride0,
+            k_ref0,
+        ) = inst0.args  # type: ignore[misc]
+
+        def _sig(inst: Any) -> tuple[int, int, int, int, int, int]:
+            (
+                a_buf,
+                a_base,
+                a_stride,
+                b_buf,
+                _b_base,
+                b_stride,
+                k_ref,
+            ) = inst.args  # type: ignore[misc]
+            return (
+                a_buf.id,
+                a_base.id,
+                a_stride.id,
+                b_buf.id,
+                b_stride.id,
+                k_ref.id,
+            )
+
+        sig0 = _sig(inst0)
+        group: list[Any] = [inst0]
+        idx = start_idx + 1
+        while idx < len(ir.insts) and len(group) < 8:
+            inst = ir.insts[idx]
+            if inst.op != "dot" or inst.out is None:
+                break
+            if _sig(inst) != sig0:
+                break
+            group.append(inst)
+            idx += 1
+
+        a_name = _ref(ctx, a_buf0)
+        b_name = _ref(ctx, b_buf0)
+        k_name = _ref(ctx, k_ref0)
+        k_var = f"k{inst0.out.id}"
+
+        for inst in group:
+            assert inst.out is not None
+            lines.append(f"{indent}float v{inst.out.id} = 0.0f;")
+
+        a_idx_name = f"a_idx{inst0.out.id}"
+        lines.append(f"{indent}uint {a_idx_name} = {_ref(ctx, a_base0)};")
+        b_idx_vars: list[str] = []
+        for inst in group:
+            assert inst.out is not None
+            (
+                _a_buf,
+                _a_base,
+                _a_stride,
+                _b_buf,
+                b_base,
+                _b_stride,
+                _k_ref,
+            ) = inst.args  # type: ignore[misc]
+            b_idx = f"b_idx{inst.out.id}"
+            b_idx_vars.append(b_idx)
+            lines.append(f"{indent}uint {b_idx} = {_ref(ctx, b_base)};")
+
+        k_const = _const_u32(k_ref0)
+        if k_const is not None and 1 <= k_const <= 32:
+            lines.append(f"{indent}#pragma clang loop unroll_count({k_const})")
+        lines.append(
+            f"{indent}for (uint {k_var} = 0; {k_var} < {k_name}; ++{k_var}) {{"
+        )
+        lines.append(f"{indent}  float a_val = {a_name}[{a_idx_name}];")
+        for inst, b_idx in zip(group, b_idx_vars, strict=True):
+            assert inst.out is not None
+            lines.append(
+                f"{indent}  v{inst.out.id} = fma(a_val, {b_name}[{b_idx}], v{inst.out.id});"
+            )
+            lines.append(f"{indent}  {b_idx} += {_ref(ctx, b_stride0)};")
+        lines.append(f"{indent}  {a_idx_name} += {_ref(ctx, a_stride0)};")
+        lines.append(f"{indent}}}")
+        return len(group)
+
+    idx = 0
+    while idx < len(ir.insts):
+        inst = ir.insts[idx]
         if (
             inst.out is not None
             and use_counts.get(inst.out.id, 0) == 0
             and inst.op != "store"
         ):
-            # Skip unused SSA defs (notably arange kept for threadgroup_size).
+            idx += 1
             continue
-        if idx in moved_inst_idxs:
+        if idx in moved_inst_idxs or idx in alloc_tg_inst_idxs:
+            idx += 1
             continue
-        if idx in alloc_tg_inst_idxs:
+        if inst.op in {"arg"}:
+            idx += 1
             continue
 
-        if inst.op in {"arg"}:
+        if inst.op == "dot":
+            idx += _emit_dot_group(idx, indent="  ")
             continue
+
         if inst.op == "store" and idx in lifted_by_store:
             _buf_ref, _off_ref, _val_ref, mask_ref = inst.args  # type: ignore[misc]
             if (
@@ -492,7 +731,10 @@ def ir_to_msl(ir: IRModule) -> tuple[str, int]:
                     )
                 _emit_inst(inst, indent="    ", in_guard_for_mask=mask_ref)
                 lines.append("  }")
-        elif inst.op == "store" and early_return_store_idx == idx:
+            idx += 1
+            continue
+
+        if inst.op == "store" and early_return_store_idx == idx:
             _buf_ref, _off_ref, _val_ref, mask_ref = inst.args  # type: ignore[misc]
             if (
                 isinstance(mask_ref, ValueRef)
@@ -503,8 +745,11 @@ def ir_to_msl(ir: IRModule) -> tuple[str, int]:
                 _emit_inst(inst, indent="  ", in_guard_for_mask=mask_ref)
             else:
                 _emit_inst(inst, indent="  ", in_guard_for_mask=None)
-        else:
-            _emit_inst(inst, indent="  ", in_guard_for_mask=None)
+            idx += 1
+            continue
+
+        _emit_inst(inst, indent="  ", in_guard_for_mask=None)
+        idx += 1
 
     lines.append("}")
     return ("\n".join(lines) + "\n", threadgroup_size)

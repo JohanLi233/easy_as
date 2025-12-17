@@ -69,6 +69,21 @@ class val:
     def __lt__(self, other: Any) -> "val":
         return _b().lt(self, other)
 
+    def __and__(self, other: Any) -> "val":
+        return _b().and_(self, other)
+
+    def __rand__(self, other: Any) -> "val":
+        return _b().and_(other, self)
+
+    def __or__(self, other: Any) -> "val":
+        return _b().or_(self, other)
+
+    def __ror__(self, other: Any) -> "val":
+        return _b().or_(other, self)
+
+    def __invert__(self) -> "val":
+        return _b().not_(self)
+
 
 def program_id(axis: int) -> val:
     return _b().program_id(axis)
@@ -92,6 +107,10 @@ def arange(start: int, size: int) -> val:
 
 def alloc_tg(size: int) -> val:
     return _b().alloc_tg(size)
+
+
+def alloc_tg_f16(size: int) -> val:
+    return _b().alloc_tg(size, dtype=DType.F16)
 
 
 def barrier() -> None:
@@ -118,5 +137,53 @@ def to_f32(x: Any) -> val:
     return _b().cast(x, DType.F32)
 
 
+def to_f16(x: Any) -> val:
+    return _b().cast(x, DType.F16)
+
+
 def to_u32(x: Any) -> val:
     return _b().cast(x, DType.U32)
+
+
+def and_(a: Any, b: Any) -> val:
+    return _b().and_(a, b)
+
+
+def or_(a: Any, b: Any) -> val:
+    return _b().or_(a, b)
+
+
+def not_(x: Any) -> val:
+    return _b().not_(x)
+
+
+def dot(
+    a_buffer: Any,
+    a_base: Any,
+    a_stride: Any,
+    b_buffer: Any,
+    b_base: Any,
+    b_stride: Any,
+    K: Any,
+) -> val:
+    return _b().dot(a_buffer, a_base, a_stride, b_buffer, b_base, b_stride, K)
+
+
+def mma_zero() -> val:
+    return _b().mma_zero()
+
+
+def mma(
+    a_buffer: Any,
+    a_base: Any,
+    a_stride: Any,
+    b_buffer: Any,
+    b_base: Any,
+    b_stride: Any,
+    acc: Any,
+) -> val:
+    return _b().mma(a_buffer, a_base, a_stride, b_buffer, b_base, b_stride, acc)
+
+
+def mma_store(buffer: Any, base: Any, stride: Any, frag: Any) -> None:
+    _b().mma_store(buffer, base, stride, frag)

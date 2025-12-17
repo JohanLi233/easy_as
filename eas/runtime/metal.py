@@ -223,11 +223,18 @@ class MetalRuntime:
         sync: bool = True,
         nthreads: int | None = None,
         grid: tuple[int, int, int] | None = None,
+        tptg: tuple[int, int, int] | None = None,
         shape: tuple[int, ...] | None = None,
     ) -> None:
         _ = meta
         ir: IRModule = ck.ir
         threadgroup_size: int = ck.threadgroup_size
+
+        tptg_eff: int | tuple[int, int, int]
+        if tptg is None:
+            tptg_eff = int(threadgroup_size)
+        else:
+            tptg_eff = tuple(int(x) for x in tptg)
 
         if grid is None:
             inferred = infer_grid(ir, runtime_args, threadgroup_size, shape=shape)
@@ -236,21 +243,31 @@ class MetalRuntime:
                 if n == 0:
                     return
                 tpg: int | tuple[int, int, int] = int(n)
-                tptg: int | tuple[int, int, int] = int(threadgroup_size)
+                tptg = tptg_eff
             else:
                 gx, gy, gz = inferred
                 if gx == 0 or gy == 0 or gz == 0:
                     return
-                tpg = (gx * int(threadgroup_size), gy, gz)
-                tptg = (int(threadgroup_size), 1, 1)
+                if isinstance(tptg_eff, int):
+                    tx, ty, tz = int(tptg_eff), 1, 1
+                    tptg = (tx, ty, tz)
+                else:
+                    tx, ty, tz = tptg_eff
+                    tptg = (tx, ty, tz)
+                tpg = (gx * int(tx), gy * int(ty), gz * int(tz))
         else:
             gx, gy, gz = map(int, grid)
             if gx < 0 or gy < 0 or gz < 0:
                 raise ValueError("grid dims must be >= 0")
             if gx == 0 or gy == 0 or gz == 0:
                 return
-            tpg = (gx * int(threadgroup_size), gy, gz)
-            tptg = (int(threadgroup_size), 1, 1)
+            if isinstance(tptg_eff, int):
+                tx, ty, tz = int(tptg_eff), 1, 1
+                tptg = (tx, ty, tz)
+            else:
+                tx, ty, tz = tptg_eff
+                tptg = (tx, ty, tz)
+            tpg = (gx * int(tx), gy * int(ty), gz * int(tz))
         writes = ck.writes
 
         argv, writable, host_copies = self._build_argv(
@@ -297,6 +314,7 @@ class MetalRuntime:
         torch_mps_sync: bool = False,
         nthreads: int | None = None,
         grid: tuple[int, int, int] | None = None,
+        tptg: tuple[int, int, int] | None = None,
         shape: tuple[int, ...] | None = None,
     ) -> float:
         _ = meta
@@ -310,6 +328,12 @@ class MetalRuntime:
         ir: IRModule = ck.ir
         threadgroup_size: int = ck.threadgroup_size
 
+        tptg_eff: int | tuple[int, int, int]
+        if tptg is None:
+            tptg_eff = int(threadgroup_size)
+        else:
+            tptg_eff = tuple(int(x) for x in tptg)
+
         if grid is None:
             inferred = infer_grid(ir, runtime_args, threadgroup_size, shape=shape)
             if inferred is None:
@@ -317,21 +341,31 @@ class MetalRuntime:
                 if n == 0:
                     return 0.0
                 tpg: int | tuple[int, int, int] = int(n)
-                tptg: int | tuple[int, int, int] = int(threadgroup_size)
+                tptg = tptg_eff
             else:
                 gx, gy, gz = inferred
                 if gx == 0 or gy == 0 or gz == 0:
                     return 0.0
-                tpg = (gx * int(threadgroup_size), gy, gz)
-                tptg = (int(threadgroup_size), 1, 1)
+                if isinstance(tptg_eff, int):
+                    tx, ty, tz = int(tptg_eff), 1, 1
+                    tptg = (tx, ty, tz)
+                else:
+                    tx, ty, tz = tptg_eff
+                    tptg = (tx, ty, tz)
+                tpg = (gx * int(tx), gy * int(ty), gz * int(tz))
         else:
             gx, gy, gz = map(int, grid)
             if gx < 0 or gy < 0 or gz < 0:
                 raise ValueError("grid dims must be >= 0")
             if gx == 0 or gy == 0 or gz == 0:
                 return 0.0
-            tpg = (gx * int(threadgroup_size), gy, gz)
-            tptg = (int(threadgroup_size), 1, 1)
+            if isinstance(tptg_eff, int):
+                tx, ty, tz = int(tptg_eff), 1, 1
+                tptg = (tx, ty, tz)
+            else:
+                tx, ty, tz = tptg_eff
+                tptg = (tx, ty, tz)
+            tpg = (gx * int(tx), gy * int(ty), gz * int(tz))
 
         argv, writable, host_copies = self._build_argv(
             ir, runtime_args, ck.writes, torch_mps_sync=torch_mps_sync
