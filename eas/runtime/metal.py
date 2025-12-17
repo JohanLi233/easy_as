@@ -28,6 +28,9 @@ def _is_numpy_array(v: Any) -> bool:
 def _pack_scalar(dtype: DType, value: Any) -> bytes:
     if dtype == DType.U32:
         return struct.pack("<I", int(value))
+    if dtype == DType.F16:
+        v = np.float16(value)
+        return v.tobytes()
     if dtype == DType.F32:
         return struct.pack("<f", float(value))
     if dtype == DType.BOOL:
@@ -108,7 +111,7 @@ class MetalRuntime:
             cache.pop(key, None)
 
         cap = t.__dlpack__()
-        buf, _shape = self._mod().dlpack_import(cap)
+        buf, _shape, _dtype_bits = self._mod().dlpack_import(cap)
         try:
             weakref.finalize(t, cache.pop, key, None)
             cache[key] = (weakref.ref(t), buf)
@@ -161,8 +164,18 @@ class MetalRuntime:
             if arg.kind == "buffer":
                 if torch_mod is not None and isinstance(v, torch_mod.Tensor):
                     t = v.detach() if getattr(v, "requires_grad", False) else v
-                    if t.dtype != torch_mod.float32:
-                        raise TypeError(f"{arg.name!r} must be float32, got {t.dtype}")
+                    if arg.dtype == DType.F32:
+                        if t.dtype != torch_mod.float32:
+                            raise TypeError(
+                                f"{arg.name!r} must be float32, got {t.dtype}"
+                            )
+                    elif arg.dtype == DType.F16:
+                        if t.dtype != torch_mod.float16:
+                            raise TypeError(
+                                f"{arg.name!r} must be float16, got {t.dtype}"
+                            )
+                    else:  # pragma: no cover
+                        raise TypeError(f"unsupported buffer dtype: {arg.dtype}")
                     if t.device.type == "mps":
                         if torch_mps_sync_enabled and not torch_mps_synced:
                             torch_mod.mps.synchronize()
@@ -180,13 +193,27 @@ class MetalRuntime:
                         )
                 if _is_tensor(v):
                     if getattr(v, "device", None) in ("mps", "metal"):
+                        expected_dtype = (
+                            np.dtype(np.float16)
+                            if arg.dtype == DType.F16
+                            else np.dtype(np.float32)
+                        )
+                        if np.dtype(v.dtype) != expected_dtype:
+                            raise TypeError(
+                                f"{arg.name!r} dtype mismatch: expected {expected_dtype}, got {v.dtype}"
+                            )
                         argv.append(v._metal_buffer())  # type: ignore[attr-defined]
                         writable.append(arg.name in writes)
                         continue
                     v = v.numpy()  # type: ignore[assignment]
                 if _is_numpy_array(v):
-                    if v.dtype != np.float32:
-                        raise TypeError(f"{arg.name!r} must be float32, got {v.dtype}")
+                    if arg.dtype not in (DType.F16, DType.F32):
+                        raise TypeError(f"unsupported buffer dtype: {arg.dtype}")
+                    expected = np.float32 if arg.dtype == DType.F32 else np.float16
+                    if v.dtype != expected:
+                        raise TypeError(
+                            f"{arg.name!r} must be {expected}, got {v.dtype}"
+                        )
                     if not v.flags.c_contiguous:
                         raise ValueError(f"{arg.name!r} must be C-contiguous for MVP")
 

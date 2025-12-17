@@ -496,6 +496,10 @@ static bool dlpack_is_f32(const DLDataType& dt) {
   return dt.code == kDLFloat && dt.bits == 32 && dt.lanes == 1;
 }
 
+static bool dlpack_is_f16(const DLDataType& dt) {
+  return dt.code == kDLFloat && dt.bits == 16 && dt.lanes == 1;
+}
+
 static bool dlpack_is_c_contig(const DLTensor& t) {
   if (!t.shape || t.ndim <= 0) return false;
   if (!t.strides) return true;
@@ -546,8 +550,9 @@ static PyObject* dlpack_import(PyObject* /*self*/, PyObject* args) {
     PyErr_Format(PyExc_ValueError, "dlpack_import expects kDLMetal device_type=%d", kDLMetal);
     return nullptr;
   }
-  if (!dlpack_is_f32(t.dtype)) {
-    PyErr_SetString(PyExc_TypeError, "dlpack_import only supports float32 tensors");
+  const int elem_bytes = dlpack_is_f32(t.dtype) ? 4 : (dlpack_is_f16(t.dtype) ? 2 : 0);
+  if (elem_bytes == 0) {
+    PyErr_SetString(PyExc_TypeError, "dlpack_import only supports float32/float16 tensors");
     return nullptr;
   }
   if (!dlpack_is_c_contig(t)) {
@@ -562,15 +567,15 @@ static PyObject* dlpack_import(PyObject* /*self*/, PyObject* args) {
   }
 
   const uint64_t offset = t.byte_offset;
-  if ((offset % 4) != 0) {
-    PyErr_SetString(PyExc_ValueError, "dlpack byte_offset must be multiple of 4");
+  if ((offset % (uint64_t)elem_bytes) != 0) {
+    PyErr_SetString(PyExc_ValueError, "dlpack byte_offset must be aligned to element size");
     return nullptr;
   }
-  if (numel > (UINT64_MAX / 4)) {
+  if (numel > (UINT64_MAX / (uint64_t)elem_bytes)) {
     PyErr_SetString(PyExc_OverflowError, "dlpack tensor too large");
     return nullptr;
   }
-  const uint64_t nbytes = numel * 4;
+  const uint64_t nbytes = numel * (uint64_t)elem_bytes;
 
   @autoreleasepool {
     id<MTLBuffer> buf = (__bridge id<MTLBuffer>)t.data;
@@ -620,16 +625,17 @@ static PyObject* dlpack_import(PyObject* /*self*/, PyObject* args) {
       PyTuple_SET_ITEM(shape_tuple, i, dim);
     }
 
-    PyObject* out = PyTuple_New(2);
-    if (!out) {
-      Py_DECREF(shape_tuple);
-      Py_DECREF(buf_capsule);
-      return nullptr;
-    }
-    PyTuple_SET_ITEM(out, 0, buf_capsule);
-    PyTuple_SET_ITEM(out, 1, shape_tuple);
-    return out;
+  PyObject* out = PyTuple_New(3);
+  if (!out) {
+    Py_DECREF(shape_tuple);
+    Py_DECREF(buf_capsule);
+    return nullptr;
   }
+  PyTuple_SET_ITEM(out, 0, buf_capsule);
+  PyTuple_SET_ITEM(out, 1, shape_tuple);
+  PyTuple_SET_ITEM(out, 2, PyLong_FromLong((long)t.dtype.bits));
+  return out;
+}
 }
 
 struct DlpackExportCtx {
@@ -704,7 +710,8 @@ static PyObject* queue_synchronize(PyObject* /*self*/, PyObject* /*args*/) {
 static PyObject* dlpack_export(PyObject* /*self*/, PyObject* args) {
   PyObject* capsule = nullptr;
   PyObject* shape_obj = nullptr;
-  if (!PyArg_ParseTuple(args, "OO", &capsule, &shape_obj)) return nullptr;
+  int dtype_bits = 32;
+  if (!PyArg_ParseTuple(args, "OOi", &capsule, &shape_obj, &dtype_bits)) return nullptr;
 
   void* ptr = PyCapsule_GetPointer(capsule, kBufferCapsuleName);
   if (!ptr) return nullptr;
@@ -754,16 +761,27 @@ static PyObject* dlpack_export(PyObject* /*self*/, PyObject* args) {
     return nullptr;
   }
 
-  if (numel > (UINT64_MAX / 4)) {
+  const uint64_t elem_bytes = (dtype_bits == 16) ? 2 : ((dtype_bits == 32) ? 4 : 0);
+  if (elem_bytes == 0) {
+    free(shape_arr);
+    PyErr_SetString(PyExc_ValueError, "dtype_bits must be 16 or 32");
+    return nullptr;
+  }
+  if (numel > (UINT64_MAX / elem_bytes)) {
     free(shape_arr);
     PyErr_SetString(PyExc_OverflowError, "tensor too large");
     return nullptr;
   }
 
-  const uint64_t nbytes = numel * 4;
+  const uint64_t nbytes = numel * elem_bytes;
   if (nbytes > (uint64_t)b->nbytes) {
     free(shape_arr);
     PyErr_SetString(PyExc_ValueError, "shape exceeds buffer view size");
+    return nullptr;
+  }
+  if (((uint64_t)b->offset % elem_bytes) != 0) {
+    free(shape_arr);
+    PyErr_SetString(PyExc_ValueError, "buffer byte_offset must be aligned to element size");
     return nullptr;
   }
 
@@ -781,7 +799,7 @@ static PyObject* dlpack_export(PyObject* /*self*/, PyObject* args) {
   mt->dl_tensor.device.device_id = 0;
   mt->dl_tensor.ndim = (int)ndim;
   mt->dl_tensor.dtype.code = kDLFloat;
-  mt->dl_tensor.dtype.bits = 32;
+  mt->dl_tensor.dtype.bits = (uint8_t)dtype_bits;
   mt->dl_tensor.dtype.lanes = 1;
   mt->dl_tensor.shape = shape_arr;
   mt->dl_tensor.strides = nullptr;

@@ -42,9 +42,11 @@ def _normalize_device(device: str | None) -> Device:
     return device_l  # type: ignore[return-value]
 
 
-def _require_float32(dtype: np.dtype) -> None:
-    if np.dtype(dtype) != np.float32:
-        raise TypeError(f"only float32 tensors are supported in MVP (got {dtype})")
+def _require_supported_dtype(dtype: np.dtype) -> np.dtype:
+    dtype_n = np.dtype(dtype)
+    if dtype_n not in (np.float16, np.float32):
+        raise TypeError(f"only float16/float32 tensors are supported (got {dtype_n})")
+    return dtype_n
 
 
 def _numel(shape: tuple[int, ...]) -> int:
@@ -75,8 +77,7 @@ class Tensor:
         cpu: np.ndarray | None = None,
         metal: _MetalStorage | None = None,
     ) -> None:
-        dtype = np.dtype(dtype)
-        _require_float32(dtype)
+        dtype = _require_supported_dtype(dtype)
         self._shape = tuple(int(d) for d in shape)
         self._dtype = dtype
         self._device: Device = device
@@ -136,7 +137,8 @@ class Tensor:
                 "Metal extension `eas._metal` is missing DLPack export API; rebuild it with "
                 "`uv run python tools/build_metal_ext.py`."
             )
-        return mod.dlpack_export(metal.buf, self._shape)
+        dtype_bits = int(self._dtype.itemsize) * 8
+        return mod.dlpack_export(metal.buf, self._shape, int(dtype_bits))
 
     def __dlpack_device__(self) -> tuple[int, int]:
         if self._device == "cpu":
@@ -248,10 +250,14 @@ def tensor(
         assert torch is not None
 
         t = data.detach() if getattr(data, "requires_grad", False) else data
-        if dtype is not None and np.dtype(dtype) != np.float32:
-            raise TypeError("only float32 tensors are supported in MVP")
-        if t.dtype != torch.float32:
-            t = t.to(dtype=torch.float32)
+        if dtype is not None:
+            dtype_n = _require_supported_dtype(np.dtype(dtype))
+            torch_dtype = torch.float16 if dtype_n == np.float16 else torch.float32
+            if t.dtype != torch_dtype:
+                t = t.to(dtype=torch_dtype)
+        else:
+            if t.dtype not in (torch.float16, torch.float32):
+                t = t.to(dtype=torch.float32)
 
         if device_n == "mps" and t.device.type == "mps":
             if os.environ.get("EAS_TORCH_MPS_SYNC", "1").strip().lower() not in (
@@ -270,12 +276,19 @@ def tensor(
                     "`uv run python tools/build_metal_ext.py`."
                 )
             cap = t.__dlpack__()
-            buf, shape = mod.dlpack_import(cap)
+            buf, shape, dtype_bits = mod.dlpack_import(cap)
             shape_t = tuple(int(d) for d in shape)
-            nbytes = _numel(shape_t) * 4
+            bits_i = int(dtype_bits)
+            if bits_i == 16:
+                dtype_np = np.float16
+            elif bits_i == 32:
+                dtype_np = np.float32
+            else:
+                raise TypeError(f"unsupported dlpack dtype bits: {dtype_bits}")
+            nbytes = _numel(shape_t) * int(np.dtype(dtype_np).itemsize)
             return Tensor(
                 shape=shape_t,
-                dtype=np.float32,
+                dtype=dtype_np,
                 device="mps",
                 metal=_MetalStorage(buf=buf, nbytes=nbytes, storage="private"),
             )
@@ -284,7 +297,7 @@ def tensor(
             t = t.to("cpu")
         cpu_arr = t.contiguous().numpy()
         cpu_t = Tensor(
-            shape=tuple(cpu_arr.shape), dtype=np.float32, device="cpu", cpu=cpu_arr
+            shape=tuple(cpu_arr.shape), dtype=cpu_arr.dtype, device="cpu", cpu=cpu_arr
         )
         return cpu_t.to(device_n)
 
@@ -295,14 +308,20 @@ def tensor(
                 out = out.to("cpu")
             out = Tensor(
                 shape=out.shape,
-                dtype=np.dtype(dtype),
+                dtype=_require_supported_dtype(np.dtype(dtype)),
                 device="cpu",
                 cpu=out.numpy().astype(dtype, copy=True),
             )
         return out.to(device_n)
 
-    arr = np.asarray(data, dtype=np.float32 if dtype is None else dtype)
-    _require_float32(arr.dtype)
+    if dtype is None:
+        arr = np.asarray(data)
+        if np.dtype(arr.dtype) not in (np.float16, np.float32):
+            arr = arr.astype(np.float32)
+    else:
+        dtype_n = _require_supported_dtype(np.dtype(dtype))
+        arr = np.asarray(data, dtype=dtype_n)
+    _ = _require_supported_dtype(arr.dtype)
     if not arr.flags.c_contiguous:
         arr = np.ascontiguousarray(arr)
     cpu_t = Tensor(shape=arr.shape, dtype=arr.dtype, device="cpu", cpu=arr)
@@ -316,8 +335,7 @@ def empty(
     dtype: np.dtype | None = None,
 ) -> Tensor:
     device_n = _normalize_device(device)
-    dtype_n = np.dtype(np.float32 if dtype is None else dtype)
-    _require_float32(dtype_n)
+    dtype_n = _require_supported_dtype(np.dtype(np.float32 if dtype is None else dtype))
     shape_t = (int(shape),) if isinstance(shape, int) else tuple(int(d) for d in shape)
 
     if device_n == "cpu":

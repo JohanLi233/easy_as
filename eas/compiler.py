@@ -59,6 +59,8 @@ def _scalar_dtype(v: Any) -> DType:
         return DType.BOOL
     if isinstance(v, (int, np.integer)):
         return DType.U32
+    if isinstance(v, (np.float16,)):
+        return DType.F16
     if isinstance(v, (float, np.floating)):
         return DType.F32
     raise TypeError(f"unsupported scalar type: {type(v)!r}")
@@ -67,7 +69,9 @@ def _scalar_dtype(v: Any) -> DType:
 def _buffer_dtype(a: np.ndarray) -> DType:
     if a.dtype == np.float32:
         return DType.F32
-    raise TypeError(f"unsupported dtype: {a.dtype} (expected float32)")
+    if a.dtype == np.float16:
+        return DType.F16
+    raise TypeError(f"unsupported dtype: {a.dtype} (expected float32 or float16)")
 
 
 def _is_tensor(v: Any) -> bool:
@@ -90,7 +94,9 @@ def _torch_buffer_dtype(v: Any) -> DType:
         raise TypeError("torch tensor provided but torch is not importable")
     if v.dtype == torch.float32:
         return DType.F32
-    raise TypeError(f"unsupported torch dtype: {v.dtype} (expected float32)")
+    if v.dtype == torch.float16:
+        return DType.F16
+    raise TypeError(f"unsupported torch dtype: {v.dtype} (expected float32 or float16)")
 
 
 def _tensor_dtype(v: Any) -> DType:
@@ -99,7 +105,9 @@ def _tensor_dtype(v: Any) -> DType:
         raise TypeError("tensor argument is missing dtype")
     if np.dtype(dt) == np.float32:
         return DType.F32
-    raise TypeError(f"unsupported tensor dtype: {dt} (expected float32)")
+    if np.dtype(dt) == np.float16:
+        return DType.F16
+    raise TypeError(f"unsupported tensor dtype: {dt} (expected float32 or float16)")
 
 
 def _runtime_arg_sig(v: Any) -> RuntimeArgSig:
@@ -141,11 +149,11 @@ class _IRBuilder:
             v = self._new(DType.BOOL)
             self.insts.append(Inst("const", v.ref, (bool(x),)))
             return v
-        if isinstance(x, int):
+        if isinstance(x, (int, np.integer)):
             v = self._new(DType.U32)
             self.insts.append(Inst("const", v.ref, (int(x),)))
             return v
-        if isinstance(x, float):
+        if isinstance(x, (float, np.floating)):
             v = self._new(DType.F32)
             self.insts.append(Inst("const", v.ref, (float(x),)))
             return v

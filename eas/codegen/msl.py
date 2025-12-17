@@ -315,7 +315,7 @@ def ir_to_msl(ir: IRModule) -> tuple[str, int]:
         if arg.kind == "buffer":
             const_kw = "" if arg.name in uses_store else "const "
             params.append(
-                f"device {const_kw}float* __restrict {arg.name} [[buffer({buf_index})]]"
+                f"device {const_kw}{_msl_type(arg.dtype)}* __restrict {arg.name} [[buffer({buf_index})]]"
             )
         else:
             params.append(
@@ -470,9 +470,14 @@ def ir_to_msl(ir: IRModule) -> tuple[str, int]:
             out = inst.out
             assert out is not None
             x, y, z = inst.args  # type: ignore[misc]
-            lines.append(
-                f"{indent}{_msl_type(out.dtype)} v{out.id} = fma({_ref(ctx, x)}, {_ref(ctx, y)}, {_ref(ctx, z)});"
-            )
+            if out.dtype == DType.F16:
+                lines.append(
+                    f"{indent}half v{out.id} = half(fma((float){_ref(ctx, x)}, (float){_ref(ctx, y)}, (float){_ref(ctx, z)}));"
+                )
+            else:
+                lines.append(
+                    f"{indent}{_msl_type(out.dtype)} v{out.id} = fma({_ref(ctx, x)}, {_ref(ctx, y)}, {_ref(ctx, z)});"
+                )
             return
         if inst.op == "load":
             out = inst.out

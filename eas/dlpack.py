@@ -33,12 +33,21 @@ def from_dlpack(x: Any, *, device: Device | str | None = None) -> Tensor:
                     "object does not implement the DLPack protocol (__dlpack__)"
                 )
             capsule = dlpack_fn()
-        buf, shape = mod.dlpack_import(capsule)
+        buf, shape, dtype_bits = mod.dlpack_import(capsule)
         shape_t = tuple(int(d) for d in shape)
-        nbytes = int(np.prod(shape_t, dtype=np.int64)) * 4
+        bits_i = int(dtype_bits)
+        if bits_i == 16:
+            dtype_np = np.float16
+        elif bits_i == 32:
+            dtype_np = np.float32
+        else:
+            raise TypeError(f"unsupported dlpack dtype bits: {dtype_bits}")
+        nbytes = int(np.prod(shape_t, dtype=np.int64)) * int(
+            np.dtype(dtype_np).itemsize
+        )
         return Tensor(
             shape=shape_t,
-            dtype=np.float32,
+            dtype=dtype_np,
             device="mps",
             metal=_MetalStorage(buf=buf, nbytes=nbytes, storage="private"),
         )
@@ -51,8 +60,8 @@ def from_dlpack(x: Any, *, device: Device | str | None = None) -> Tensor:
             "object does not support DLPack import via numpy.from_dlpack"
         ) from e
 
-    if arr.dtype != np.float32:
-        raise TypeError("only float32 tensors are supported in MVP")
+    if arr.dtype not in (np.float16, np.float32):
+        raise TypeError("only float16/float32 tensors are supported")
     if not arr.flags.c_contiguous:
         arr = np.ascontiguousarray(arr)
     return _tensor(arr, device=device_n)
