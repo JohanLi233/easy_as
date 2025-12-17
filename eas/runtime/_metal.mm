@@ -842,9 +842,13 @@ static NSUInteger pick_threads_per_threadgroup(const Pipeline* p, NSUInteger req
   }
 
   if (t > maxT) t = maxT;
-  // Round down to multiple of w.
-  t = (t / w) * w;
-  if (t == 0) t = w;
+  // Round down to multiple of w for the auto-selected default.
+  // NOTE: callers that pass an explicit threads_per_threadgroup should not go
+  // through this helper: we must not silently change user-requested sizes.
+  if (requested == 0) {
+    t = (t / w) * w;
+    if (t == 0) t = w;
+  }
   return t;
 }
 
@@ -1095,13 +1099,13 @@ static PyObject* launch_threads_impl(PyObject* args, bool async) {
         Py_DECREF(argv);
         return nullptr;
       }
-      if (tptg_y_ull == 0 || tptg_z_ull == 0) {
+      if (tptg_x_ull == 0 || tptg_y_ull == 0 || tptg_z_ull == 0) {
         Py_DECREF(writable);
         Py_DECREF(argv);
         PyErr_SetString(PyExc_ValueError, "threads_per_threadgroup dims must be > 0");
         return nullptr;
       }
-      tptg_x = pick_threads_per_threadgroup(pipeline, (NSUInteger)tptg_x_ull);
+      tptg_x = (NSUInteger)tptg_x_ull;
       tptg_y = (NSUInteger)tptg_y_ull;
       tptg_z = (NSUInteger)tptg_z_ull;
     }

@@ -274,7 +274,20 @@ class Kernel:
             meta, _runtime_opts = self._autotune_select(
                 spec, meta, runtime_args, raw_opts
             )
-        return self._compile_from_split(meta, runtime_args)
+        ck = self._compile_from_split(meta, runtime_args)
+        raw_tptg = raw_opts.get("tptg")
+        if raw_tptg is not None:
+            runtime_opts = self._normalize_runtime_options(raw_opts, meta, runtime_args)
+            tptg = runtime_opts.get("tptg")
+            if tptg is None:
+                raise RuntimeError("internal error: normalized tptg must not be None")
+            tx, ty, tz = (int(tptg[0]), int(tptg[1]), int(tptg[2]))
+            if (tx, ty, tz) != (int(ck.threadgroup_size), 1, 1):
+                raise ValueError(
+                    f"_tptg must match threadgroup_size inferred from mk.arange(0, BLOCK): "
+                    f"expected ({int(ck.threadgroup_size)}, 1, 1), got ({tx}, {ty}, {tz})"
+                )
+        return ck
 
     def __call__(self, /, *args: Any, **kwargs: Any) -> None:
         raw_opts = self._extract_runtime_options(kwargs)
@@ -287,6 +300,17 @@ class Kernel:
         else:
             runtime_opts = self._normalize_runtime_options(raw_opts, meta, runtime_args)
         ck = self._compile_from_split(meta, runtime_args)
+        raw_tptg = raw_opts.get("tptg")
+        if raw_tptg is not None:
+            tptg = runtime_opts.get("tptg")
+            if tptg is None:
+                raise RuntimeError("internal error: normalized tptg must not be None")
+            tx, ty, tz = (int(tptg[0]), int(tptg[1]), int(tptg[2]))
+            if (tx, ty, tz) != (int(ck.threadgroup_size), 1, 1):
+                raise ValueError(
+                    f"_tptg must match threadgroup_size inferred from mk.arange(0, BLOCK): "
+                    f"expected ({int(ck.threadgroup_size)}, 1, 1), got ({tx}, {ty}, {tz})"
+                )
         get_runtime().run(ck, runtime_args, meta, **runtime_opts)
 
     def to_msl(self, /, *args: Any, **kwargs: Any) -> str:

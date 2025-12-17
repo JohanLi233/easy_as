@@ -171,6 +171,14 @@ def ir_to_msl(ir: IRModule) -> tuple[str, int]:
             return "threadgroup"
         return None
 
+    def _load_as_float(buf: ValueRef, idx_expr: str) -> str:
+        name = _ref(ctx, buf)
+        if buf.dtype == DType.F32:
+            return f"{name}[{idx_expr}]"
+        if buf.dtype == DType.F16:
+            return f"float({name}[{idx_expr}])"
+        raise ValueError(f"unsupported dot buffer dtype: {buf.dtype}")
+
     def _base_plus_const(ref: ValueRef) -> tuple[ValueRef, int] | None:
         """
         Match `ref = add(base, const)` (commuted by CSE) and return (base, const).
@@ -635,9 +643,9 @@ def ir_to_msl(ir: IRModule) -> tuple[str, int]:
             lines.append(
                 f"{indent}for (uint {k_var} = 0; {k_var} < {k_name}; ++{k_var}) {{"
             )
-            lines.append(
-                f"{indent}  v{out.id} = fma({a_name}[a_idx{out.id}], {b_name}[b_idx{out.id}], v{out.id});"
-            )
+            a_load = _load_as_float(a_buf, f"a_idx{out.id}")
+            b_load = _load_as_float(b_buf, f"b_idx{out.id}")
+            lines.append(f"{indent}  v{out.id} = fma({a_load}, {b_load}, v{out.id});")
             lines.append(
                 f"{indent}  a_idx{out.id} += {_ref(ctx, a_stride)}; b_idx{out.id} += {_ref(ctx, b_stride)};"
             )
@@ -784,10 +792,10 @@ def ir_to_msl(ir: IRModule) -> tuple[str, int]:
             assert isinstance(b_base, ValueRef)
             b_bases.append(b_base)
 
-        # Try to vectorize 4 contiguous B loads via packed_float4.
+        # Try to vectorize 4 contiguous B loads via packed_{float,half}4.
         vec4_idxs: dict[int, int] = {}  # group index -> lane 0..3
         vec4_base: ValueRef | None = None
-        if b_buf0.dtype == DType.F32 and len(group) >= 4:
+        if b_buf0.dtype in (DType.F32, DType.F16) and len(group) >= 4:
             candidates: list[tuple[int, ValueRef, int]] = []
             for gi, b_base in enumerate(b_bases):
                 if gi >= 4:
@@ -829,27 +837,49 @@ def ir_to_msl(ir: IRModule) -> tuple[str, int]:
         lines.append(
             f"{indent}for (uint {k_var} = 0; {k_var} < {k_name}; ++{k_var}) {{"
         )
-        lines.append(f"{indent}  float a_val = {a_name}[{a_idx_name}];")
+        lines.append(f"{indent}  float a_val = {_load_as_float(a_buf0, a_idx_name)};")
         if vec4_base is not None and b_idx0_name is not None and vec4_idxs:
             space = _buf_addr_space(b_buf0) or "device"
-            lines.append(
-                f"{indent}  packed_float4 b_pack = *(({space} packed_float4*)({b_name} + {b_idx0_name}));"
-            )
-            lines.append(
-                f"{indent}  float4 b_vec = float4(b_pack.x, b_pack.y, b_pack.z, b_pack.w);"
-            )
+            lines.append(f"{indent}  bool b_aligned4 = (({b_idx0_name} & 3u) == 0u);")
+            lines.append(f"{indent}  if (b_aligned4) {{")
+            if b_buf0.dtype == DType.F32:
+                lines.append(
+                    f"{indent}    packed_float4 b_pack = *(({space} packed_float4*)({b_name} + {b_idx0_name}));"
+                )
+                lines.append(
+                    f"{indent}    float4 b_vec = float4(b_pack.x, b_pack.y, b_pack.z, b_pack.w);"
+                )
+            else:
+                lines.append(
+                    f"{indent}    packed_half4 b_pack = *(({space} packed_half4*)({b_name} + {b_idx0_name}));"
+                )
+                lines.append(
+                    f"{indent}    float4 b_vec = float4(half4(b_pack.x, b_pack.y, b_pack.z, b_pack.w));"
+                )
             for gi, (inst, b_idx) in enumerate(zip(group, b_idx_vars, strict=True)):
                 assert inst.out is not None
                 lane = vec4_idxs.get(gi)
                 if lane is None:
-                    lines.append(
-                        f"{indent}  v{inst.out.id} = fma(a_val, {b_name}[{b_idx}], v{inst.out.id});"
-                    )
+                    b_load = _load_as_float(b_buf0, b_idx)
+                    lines.append(f"{indent}    v{inst.out.id} = fma(a_val, {b_load}, v{inst.out.id});")
                 else:
                     comp = ["x", "y", "z", "w"][lane]
                     lines.append(
-                        f"{indent}  v{inst.out.id} = fma(a_val, b_vec.{comp}, v{inst.out.id});"
+                        f"{indent}    v{inst.out.id} = fma(a_val, b_vec.{comp}, v{inst.out.id});"
                     )
+            lines.append(f"{indent}  }} else {{")
+            for gi, inst in enumerate(group):
+                assert inst.out is not None
+                lane = vec4_idxs.get(gi)
+                if lane is None:
+                    b_load = _load_as_float(b_buf0, b_idx_vars[gi])
+                    lines.append(f"{indent}    v{inst.out.id} = fma(a_val, {b_load}, v{inst.out.id});")
+                else:
+                    b_load = _load_as_float(b_buf0, f"{b_idx0_name} + {lane}u")
+                    lines.append(
+                        f"{indent}    v{inst.out.id} = fma(a_val, {b_load}, v{inst.out.id});"
+                    )
+            lines.append(f"{indent}  }}")
             for gi, b_idx in enumerate(b_idx_vars):
                 # Update vectorized lanes only once (they alias b_idx0_name).
                 if vec4_base is not None and gi in vec4_idxs:
@@ -860,9 +890,8 @@ def ir_to_msl(ir: IRModule) -> tuple[str, int]:
         else:
             for inst, b_idx in zip(group, b_idx_vars, strict=True):
                 assert inst.out is not None
-                lines.append(
-                    f"{indent}  v{inst.out.id} = fma(a_val, {b_name}[{b_idx}], v{inst.out.id});"
-                )
+                b_load = _load_as_float(b_buf0, b_idx)
+                lines.append(f"{indent}  v{inst.out.id} = fma(a_val, {b_load}, v{inst.out.id});")
                 lines.append(f"{indent}  {b_idx} += {_ref(ctx, b_stride0)};")
         lines.append(f"{indent}  {a_idx_name} += {_ref(ctx, a_stride0)};")
         lines.append(f"{indent}}}")
@@ -874,7 +903,7 @@ def ir_to_msl(ir: IRModule) -> tuple[str, int]:
         """
         Fuse 4 dots that share the same A/B pointers/strides/K and whose B bases
         are contiguous (base + 0/1/2/3), emitting one loop that loads B via a
-        single packed_float4 per k.
+        single packed_{float,half}4 per k.
 
         This targets the matmul TN=4 pattern even when the 4 `dot` insts are not
         contiguous in the IR (due to intervening add/const instructions).
@@ -904,7 +933,7 @@ def ir_to_msl(ir: IRModule) -> tuple[str, int]:
             and isinstance(k_ref0, ValueRef)
         ):
             return False
-        if b_buf0.dtype != DType.F32:
+        if b_buf0.dtype not in (DType.F32, DType.F16):
             return False
 
         def _sig(inst: Any) -> tuple[int, int, int, int, int, int]:
@@ -995,19 +1024,36 @@ def ir_to_msl(ir: IRModule) -> tuple[str, int]:
         lines.append(
             f"{indent}for (uint {k_var} = 0; {k_var} < {k_name}; ++{k_var}) {{"
         )
-        lines.append(f"{indent}  float a_val = {a_name}[{a_idx_name}];")
+        lines.append(f"{indent}  float a_val = {_load_as_float(a_buf0, a_idx_name)};")
         space = _buf_addr_space(b_buf0) or "device"
-        lines.append(
-            f"{indent}  packed_float4 b_pack = *(({space} packed_float4*)({b_name} + {b_idx_name}));"
-        )
-        lines.append(
-            f"{indent}  float4 b_vec = float4(b_pack.x, b_pack.y, b_pack.z, b_pack.w);"
-        )
+        lines.append(f"{indent}  bool b_aligned4 = (({b_idx_name} & 3u) == 0u);")
+        lines.append(f"{indent}  if (b_aligned4) {{")
+        if b_buf0.dtype == DType.F32:
+            lines.append(
+                f"{indent}    packed_float4 b_pack = *(({space} packed_float4*)({b_name} + {b_idx_name}));"
+            )
+            lines.append(
+                f"{indent}    float4 b_vec = float4(b_pack.x, b_pack.y, b_pack.z, b_pack.w);"
+            )
+        else:
+            lines.append(
+                f"{indent}    packed_half4 b_pack = *(({space} packed_half4*)({b_name} + {b_idx_name}));"
+            )
+            lines.append(
+                f"{indent}    float4 b_vec = float4(half4(b_pack.x, b_pack.y, b_pack.z, b_pack.w));"
+            )
         comps = ["x", "y", "z", "w"]
         for out_id, comp in zip(out_ids, comps, strict=True):
             lines.append(
-                f"{indent}  v{out_id} = fma(a_val, b_vec.{comp}, v{out_id});"
+                f"{indent}    v{out_id} = fma(a_val, b_vec.{comp}, v{out_id});"
             )
+        lines.append(f"{indent}  }} else {{")
+        for out_id, off in zip(out_ids, range(4), strict=True):
+            b_load = _load_as_float(b_buf0, f"{b_idx_name} + {off}u")
+            lines.append(
+                f"{indent}    v{out_id} = fma(a_val, {b_load}, v{out_id});"
+            )
+        lines.append(f"{indent}  }}")
         lines.append(f"{indent}  {b_idx_name} += {_ref(ctx, b_stride0)};")
         lines.append(f"{indent}  {a_idx_name} += {_ref(ctx, a_stride0)};")
         lines.append(f"{indent}}}")

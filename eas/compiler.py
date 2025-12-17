@@ -334,8 +334,10 @@ class _IRBuilder:
             raise TypeError("dot expects a_buffer to be a buffer (arg or alloc_tg)")
         if not isinstance(b_buffer, mk.val) or b_buffer.ref.id not in self._buffer_ids:
             raise TypeError("dot expects b_buffer to be a buffer (arg or alloc_tg)")
-        if a_buffer.dtype != DType.F32 or b_buffer.dtype != DType.F32:
-            raise TypeError("dot currently supports float32 buffers only")
+        if a_buffer.dtype not in (DType.F16, DType.F32):
+            raise TypeError("dot a_buffer must be f16/f32")
+        if b_buffer.dtype not in (DType.F16, DType.F32):
+            raise TypeError("dot b_buffer must be f16/f32")
 
         a_base_v = self._coerce(a_base)
         a_stride_v = self._coerce(a_stride)

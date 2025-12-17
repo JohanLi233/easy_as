@@ -36,8 +36,13 @@ class TestTptgOverride(unittest.TestCase):
             out0 = np.zeros(n, dtype=np.float32)
             out1 = np.zeros(n, dtype=np.float32)
 
-            tptg_independent_kernel(out0, n, BLOCK=256, _tptg=64)
-            tptg_independent_kernel(out1, n, BLOCK=256, _tptg=(128, 1, 1))
+            with self.assertRaises(ValueError):
+                tptg_independent_kernel(out0, n, BLOCK=256, _tptg=64)
+            with self.assertRaises(ValueError):
+                tptg_independent_kernel(out1, n, BLOCK=256, _tptg=(128, 1, 1))
+
+            tptg_independent_kernel(out0, n, BLOCK=256, _tptg=256)
+            tptg_independent_kernel(out1, n, BLOCK=256, _tptg=(256, 1, 1))
 
             expected = np.arange(n, dtype=np.float32)
             np.testing.assert_array_equal(out0, expected)

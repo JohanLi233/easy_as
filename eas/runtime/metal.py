@@ -257,6 +257,14 @@ class MetalRuntime:
         ir: IRModule = ck.ir
         threadgroup_size: int = ck.threadgroup_size
 
+        if tptg is not None:
+            tx, ty, tz = (int(tptg[0]), int(tptg[1]), int(tptg[2]))
+            if (tx, ty, tz) != (int(threadgroup_size), 1, 1):
+                raise ValueError(
+                    f"tptg must match threadgroup_size inferred from mk.arange(0, BLOCK): "
+                    f"expected ({int(threadgroup_size)}, 1, 1), got ({tx}, {ty}, {tz})"
+                )
+
         tptg_eff: int | tuple[int, int, int]
         if tptg is None:
             tptg_eff = int(threadgroup_size)
@@ -354,6 +362,14 @@ class MetalRuntime:
 
         ir: IRModule = ck.ir
         threadgroup_size: int = ck.threadgroup_size
+
+        if tptg is not None:
+            tx, ty, tz = (int(tptg[0]), int(tptg[1]), int(tptg[2]))
+            if (tx, ty, tz) != (int(threadgroup_size), 1, 1):
+                raise ValueError(
+                    f"tptg must match threadgroup_size inferred from mk.arange(0, BLOCK): "
+                    f"expected ({int(threadgroup_size)}, 1, 1), got ({tx}, {ty}, {tz})"
+                )
 
         tptg_eff: int | tuple[int, int, int]
         if tptg is None:
