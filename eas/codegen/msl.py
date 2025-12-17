@@ -61,6 +61,7 @@ def ir_to_msl(ir: IRModule) -> tuple[str, int]:
             "simdgroup_barrier",
         }
         threadgroup_mem_ops = {
+            "alloc_tg",
             "threadgroup_alloc",
             "alloc_threadgroup",
             "threadgroup_load",
@@ -229,9 +230,11 @@ def ir_to_msl(ir: IRModule) -> tuple[str, int]:
 
         return lifted
 
-    lifted_by_store = _lifted_region_by_store_idx()
-
     has_barrier_or_tgmem = _has_barrier_or_threadgroup_memory()
+    # Lifting computations into a per-thread store guard is unsafe when barriers or
+    # threadgroup memory are involved: it can move instructions across barriers or
+    # (worse) put barriers behind divergent control flow.
+    lifted_by_store = {} if has_barrier_or_tgmem else _lifted_region_by_store_idx()
     store_idxs = [i for i, inst in enumerate(ir.insts) if inst.op == "store"]
     allow_early_return = len(store_idxs) == 1 and not has_barrier_or_tgmem
     early_return_store_idx = store_idxs[0] if allow_early_return else None
@@ -239,6 +242,8 @@ def ir_to_msl(ir: IRModule) -> tuple[str, int]:
     needs_tgpig = False
     needs_tpitg = False
     needs_tpig = False
+    needs_lane = False
+    needs_sg = False
     for inst in ir.insts:
         if inst.out is None:
             continue
@@ -250,6 +255,12 @@ def ir_to_msl(ir: IRModule) -> tuple[str, int]:
             needs_tpitg = True
         elif inst.op == "thread_id":
             needs_tpig = True
+        elif inst.op == "local_id":
+            needs_tpitg = True
+        elif inst.op == "lane_id":
+            needs_lane = True
+        elif inst.op == "sg_id":
+            needs_sg = True
 
     lines: list[str] = []
     lines.append("#include <metal_stdlib>")
@@ -278,9 +289,25 @@ def ir_to_msl(ir: IRModule) -> tuple[str, int]:
         params.append("uint3 tgpig [[threadgroup_position_in_grid]]")
     if needs_tpitg:
         params.append("uint3 tpitg [[thread_position_in_threadgroup]]")
+    if needs_lane:
+        params.append("uint lane [[thread_index_in_simdgroup]]")
+    if needs_sg:
+        params.append("uint sg [[simdgroup_index_in_threadgroup]]")
 
     lines.append(",\n".join(f"    {p}" for p in params))
     lines.append(") {")
+
+    # threadgroup allocations (declare at top of kernel body)
+    alloc_tg_inst_idxs: set[int] = set()
+    for idx, inst in enumerate(ir.insts):
+        if inst.op != "alloc_tg":
+            continue
+        assert inst.out is not None
+        (size,) = inst.args
+        lines.append(
+            f"  threadgroup {_msl_type(inst.out.dtype)} v{inst.out.id}[{int(size)}];"
+        )
+        alloc_tg_inst_idxs.add(idx)
 
     # emit body
     moved_inst_idxs = {idx for idxs in lifted_by_store.values() for idx in idxs}
@@ -289,6 +316,8 @@ def ir_to_msl(ir: IRModule) -> tuple[str, int]:
         inst: Any, *, indent: str, in_guard_for_mask: ValueRef | None
     ) -> None:
         if inst.op in {"arg"}:
+            return
+        if inst.op == "alloc_tg":
             return
         if inst.op == "const":
             out = inst.out
@@ -314,6 +343,25 @@ def ir_to_msl(ir: IRModule) -> tuple[str, int]:
             if comp is None:
                 raise ValueError(f"thread_id axis must be 0/1/2, got {axis}")
             lines.append(f"{indent}uint v{out.id} = tpig.{comp};")
+            return
+        if inst.op == "local_id":
+            out = inst.out
+            assert out is not None
+            axis = int(inst.args[0])
+            comp = {0: "x", 1: "y", 2: "z"}.get(axis)
+            if comp is None:
+                raise ValueError(f"local_id axis must be 0/1/2, got {axis}")
+            lines.append(f"{indent}uint v{out.id} = tpitg.{comp};")
+            return
+        if inst.op == "lane_id":
+            out = inst.out
+            assert out is not None
+            lines.append(f"{indent}uint v{out.id} = lane;")
+            return
+        if inst.op == "sg_id":
+            out = inst.out
+            assert out is not None
+            lines.append(f"{indent}uint v{out.id} = sg;")
             return
         if inst.op == "arange":
             out = inst.out
@@ -353,6 +401,16 @@ def ir_to_msl(ir: IRModule) -> tuple[str, int]:
                 f"{indent}{_msl_type(out.dtype)} v{out.id} = {_ref(ctx, c)} ? {_ref(ctx, a)} : {_ref(ctx, b)};"
             )
             return
+        if inst.op == "cast":
+            out = inst.out
+            assert out is not None
+            x_ref, dst = inst.args  # type: ignore[misc]
+            if not isinstance(dst, DType):
+                raise TypeError("cast expects DType target")
+            lines.append(
+                f"{indent}{_msl_type(out.dtype)} v{out.id} = ({_msl_type(dst)})({_ref(ctx, x_ref)});"
+            )
+            return
         if inst.op == "fma":
             out = inst.out
             assert out is not None
@@ -365,7 +423,7 @@ def ir_to_msl(ir: IRModule) -> tuple[str, int]:
             out = inst.out
             assert out is not None
             buf_ref, off_ref, mask_ref = inst.args  # type: ignore[misc]
-            buf_name = ctx.arg_names[buf_ref.id]
+            buf_name = _ref(ctx, buf_ref)
 
             if in_guard_for_mask is not None and mask_ref.id == in_guard_for_mask.id:
                 lines.append(
@@ -383,7 +441,7 @@ def ir_to_msl(ir: IRModule) -> tuple[str, int]:
             return
         if inst.op == "store":
             buf_ref, off_ref, val_ref, mask_ref = inst.args  # type: ignore[misc]
-            buf_name = ctx.arg_names[buf_ref.id]
+            buf_name = _ref(ctx, buf_ref)
             if in_guard_for_mask is not None and mask_ref.id == in_guard_for_mask.id:
                 lines.append(
                     f"{indent}{buf_name}[{_ref(ctx, off_ref)}] = {_ref(ctx, val_ref)};"
@@ -392,6 +450,9 @@ def ir_to_msl(ir: IRModule) -> tuple[str, int]:
                 lines.append(
                     f"{indent}if ({_ref(ctx, mask_ref)}) {{ {buf_name}[{_ref(ctx, off_ref)}] = {_ref(ctx, val_ref)}; }}"
                 )
+            return
+        if inst.op == "barrier":
+            lines.append(f"{indent}threadgroup_barrier(mem_flags::mem_threadgroup);")
             return
         raise ValueError(f"unsupported op: {inst.op}")
 
@@ -404,6 +465,8 @@ def ir_to_msl(ir: IRModule) -> tuple[str, int]:
             # Skip unused SSA defs (notably arange kept for threadgroup_size).
             continue
         if idx in moved_inst_idxs:
+            continue
+        if idx in alloc_tg_inst_idxs:
             continue
 
         if inst.op in {"arg"}:

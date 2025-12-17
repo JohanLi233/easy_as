@@ -20,16 +20,22 @@ Op: TypeAlias = Literal[
     "const",
     "program_id",
     "thread_id",
+    "local_id",
+    "lane_id",
+    "sg_id",
     "arange",
+    "alloc_tg",
     "add",
     "mul",
     "floordiv",
     "mod",
     "lt",
     "where",
+    "cast",
     "load",
     "store",
     "fma",
+    "barrier",
 ]
 
 
@@ -99,15 +105,62 @@ def validate_ir(ir: IRModule) -> None:
             require(len(inst.args) == 1, f"const expects 1 arg, got {len(inst.args)}")
             continue
 
+        if inst.op == "alloc_tg":
+            require(inst.out is not None, "alloc_tg must produce a value")
+            require(
+                len(inst.args) == 1, f"alloc_tg expects 1 arg, got {len(inst.args)}"
+            )
+            require(
+                isinstance(inst.args[0], int) and int(inst.args[0]) > 0,
+                "alloc_tg(size) requires a positive Python int size",
+            )
+            continue
+
         if inst.op in {"program_id", "thread_id", "arange"}:
             require(inst.out is not None, f"{inst.op} must produce a value")
+            continue
+
+        if inst.op == "local_id":
+            require(inst.out is not None, "local_id must produce a value")
+            require(
+                len(inst.args) == 1, f"local_id expects 1 arg, got {len(inst.args)}"
+            )
+            require(
+                isinstance(inst.args[0], int) and int(inst.args[0]) in (0, 1, 2),
+                "local_id axis must be 0/1/2",
+            )
+            continue
+
+        if inst.op == "lane_id":
+            require(inst.out is not None, "lane_id must produce a value")
+            require(
+                len(inst.args) == 0, f"lane_id expects 0 args, got {len(inst.args)}"
+            )
+            continue
+
+        if inst.op == "sg_id":
+            require(inst.out is not None, "sg_id must produce a value")
+            require(len(inst.args) == 0, f"sg_id expects 0 args, got {len(inst.args)}")
             continue
 
         if inst.op in {"add", "mul", "floordiv", "mod", "lt", "where", "load", "fma"}:
             require(inst.out is not None, f"{inst.op} must produce a value")
 
+        if inst.op == "cast":
+            require(inst.out is not None, "cast must produce a value")
+            require(len(inst.args) == 2, f"cast expects 2 args, got {len(inst.args)}")
+            require(isinstance(inst.args[0], ValueRef), "cast expects a ValueRef input")
+            require(isinstance(inst.args[1], DType), "cast expects a DType target")
+            continue
+
         if inst.op == "store":
             require(inst.out is None, "store must not produce a value")
+
+        if inst.op == "barrier":
+            require(inst.out is None, "barrier must not produce a value")
+            require(
+                len(inst.args) == 0, f"barrier expects 0 args, got {len(inst.args)}"
+            )
 
     require(
         seen_arg_names == set(args_by_name),

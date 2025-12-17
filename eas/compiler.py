@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import types
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping
@@ -125,6 +126,7 @@ class _IRBuilder:
     name: str
     args: list[Arg]
     insts: list[Inst]
+    _buffer_ids: set[int]
     _next_id: int = 0
 
     def _new(self, dtype: DType) -> mk.val:
@@ -154,6 +156,25 @@ class _IRBuilder:
         self.insts.append(Inst("program_id", v.ref, (int(axis),)))
         return v
 
+    def local_id(self, axis: int) -> mk.val:
+        if not isinstance(axis, int):
+            raise TypeError("local_id(axis) requires an int axis")
+        if axis not in (0, 1, 2):
+            raise ValueError("local_id axis must be 0/1/2")
+        v = self._new(DType.U32)
+        self.insts.append(Inst("local_id", v.ref, (int(axis),)))
+        return v
+
+    def lane_id(self) -> mk.val:
+        v = self._new(DType.U32)
+        self.insts.append(Inst("lane_id", v.ref, ()))
+        return v
+
+    def sg_id(self) -> mk.val:
+        v = self._new(DType.U32)
+        self.insts.append(Inst("sg_id", v.ref, ()))
+        return v
+
     def arange(self, start: int, size: int) -> mk.val:
         if not isinstance(start, int) or not isinstance(size, int):
             raise TypeError(
@@ -164,6 +185,21 @@ class _IRBuilder:
         v = self._new(DType.U32)
         self.insts.append(Inst("arange", v.ref, (int(start), int(size))))
         return v
+
+    def alloc_tg(self, size: int) -> mk.val:
+        if not isinstance(size, int):
+            raise TypeError(
+                "alloc_tg(size) requires a Python int (compile-time constant)"
+            )
+        if size <= 0:
+            raise ValueError("alloc_tg(size) must be > 0")
+        v = self._new(DType.F32)
+        self.insts.append(Inst("alloc_tg", v.ref, (int(size),)))
+        self._buffer_ids.add(v.ref.id)
+        return v
+
+    def barrier(self) -> None:
+        self.insts.append(Inst("barrier", None, ()))
 
     def add(self, a: Any, b: Any) -> mk.val:
         av = self._coerce(a)
@@ -238,9 +274,21 @@ class _IRBuilder:
         self.insts.append(Inst("where", out.ref, (cv.ref, av.ref, bv.ref)))
         return out
 
+    def cast(self, x: Any, dtype: DType) -> mk.val:
+        xv = self._coerce(x)
+        if not isinstance(dtype, DType):
+            raise TypeError("cast(x, dtype) expects dtype to be a DType")
+        if xv.dtype == dtype:
+            return xv
+        out = self._new(dtype)
+        self.insts.append(Inst("cast", out.ref, (xv.ref, dtype)))
+        return out
+
     def load(self, buffer: Any, offset: Any, mask: Any | None) -> mk.val:
         if not isinstance(buffer, mk.val):
-            raise TypeError("load(buffer, ...) expects a kernel argument (buffer)")
+            raise TypeError("load(buffer, ...) expects a buffer (arg or alloc_tg)")
+        if buffer.ref.id not in self._buffer_ids:
+            raise TypeError("load(buffer, ...) expects a buffer (arg or alloc_tg)")
         offv = self._coerce(offset)
         maskv = self._coerce(True if mask is None else mask)
         if offv.dtype != DType.U32:
@@ -253,7 +301,9 @@ class _IRBuilder:
 
     def store(self, buffer: Any, offset: Any, value: Any, mask: Any | None) -> None:
         if not isinstance(buffer, mk.val):
-            raise TypeError("store(buffer, ...) expects a kernel argument (buffer)")
+            raise TypeError("store(buffer, ...) expects a buffer (arg or alloc_tg)")
+        if buffer.ref.id not in self._buffer_ids:
+            raise TypeError("store(buffer, ...) expects a buffer (arg or alloc_tg)")
         offv = self._coerce(offset)
         valv = self._coerce(value)
         maskv = self._coerce(True if mask is None else mask)
@@ -271,7 +321,7 @@ class _IRBuilder:
 def trace_to_ir(
     fn: Callable[..., Any], runtime_args: Mapping[str, Any], meta: Mapping[str, Any]
 ) -> IRModule:
-    builder = _IRBuilder(name=fn.__name__, args=[], insts=[])
+    builder = _IRBuilder(name=fn.__name__, args=[], insts=[], _buffer_ids=set())
 
     trace_kwargs: dict[str, Any] = {}
     for name, value in runtime_args.items():
@@ -290,6 +340,7 @@ def trace_to_ir(
             builder.args.append(arg)
             v = builder._new(arg.dtype)
             builder.insts.append(Inst("arg", v.ref, (name, arg.kind, arg.dtype)))
+            builder._buffer_ids.add(v.ref.id)
             trace_kwargs[name] = v
         else:
             arg = Arg(name=name, dtype=_scalar_dtype(value), kind="scalar")
@@ -366,6 +417,22 @@ def _optimize_ir(ir: IRModule) -> IRModule:
 
 
 def _rewrite_thread_id(ir: IRModule) -> IRModule:
+    disable = os.environ.get("EAS_DISABLE_THREAD_ID_REWRITE", "")
+    if disable not in {"", "0", "false", "False"}:
+        return ir
+
+    inferred_threadgroup_size: int | None = None
+    for inst in ir.insts:
+        if inst.op == "arange":
+            size = int(inst.args[1])
+            if inferred_threadgroup_size is None:
+                inferred_threadgroup_size = size
+            elif inferred_threadgroup_size != size:
+                # Multiple arange sizes: cannot safely rewrite to a single thread_id.
+                return ir
+    if inferred_threadgroup_size is None:
+        return ir
+
     def_by_id: dict[int, Inst] = {}
     for inst in ir.insts:
         if inst.out is not None:
@@ -395,6 +462,8 @@ def _rewrite_thread_id(ir: IRModule) -> IRModule:
             start, size = (int(arange_inst.args[0]), int(arange_inst.args[1]))
             if start != 0:
                 return False
+            if size != inferred_threadgroup_size:
+                return False
 
             x_ref, y_ref = mul_inst.args  # type: ignore[misc]
             if not isinstance(x_ref, ValueRef) or not isinstance(y_ref, ValueRef):
@@ -414,7 +483,7 @@ def _rewrite_thread_id(ir: IRModule) -> IRModule:
                     const_inst is not None
                     and const_inst.op == "const"
                     and isinstance(const_inst.args[0], int)
-                    and int(const_inst.args[0]) == size
+                    and int(const_inst.args[0]) == inferred_threadgroup_size
                 )
 
             return (_is_pid(x_ref) and _is_block_const(y_ref)) or (
@@ -522,8 +591,10 @@ def _cse_pure(ir: IRModule) -> IRModule:
     def _key_for(inst: Inst, out: ValueRef) -> tuple[object, ...] | None:
         if inst.op == "const":
             return ("const", out.dtype, inst.args[0])
-        if inst.op in {"program_id", "thread_id"}:
+        if inst.op in {"program_id", "thread_id", "local_id"}:
             return (inst.op, out.dtype, int(inst.args[0]))
+        if inst.op in {"lane_id", "sg_id"}:
+            return (inst.op, out.dtype)
         if inst.op == "arange":
             return ("arange", out.dtype, int(inst.args[0]), int(inst.args[1]))
         if inst.op in {"add", "mul"}:
@@ -545,6 +616,12 @@ def _cse_pure(ir: IRModule) -> IRModule:
             assert isinstance(a_ref, ValueRef)
             assert isinstance(b_ref, ValueRef)
             return ("where", out.dtype, c_ref.id, a_ref.id, b_ref.id)
+        if inst.op == "cast":
+            x_ref = _remap_arg(inst.args[0])
+            dst = inst.args[1]
+            assert isinstance(x_ref, ValueRef)
+            assert isinstance(dst, DType)
+            return ("cast", out.dtype, x_ref.id, dst)
         if inst.op == "fma":
             x_ref, y_ref, z_ref = map(_remap_arg, inst.args)
             assert isinstance(x_ref, ValueRef)
@@ -564,7 +641,7 @@ def _cse_pure(ir: IRModule) -> IRModule:
             new_insts.append(Inst(inst.op, inst.out, remapped_args))
             continue
 
-        if inst.op in {"store", "load"}:
+        if inst.op in {"store", "load", "alloc_tg", "barrier"}:
             if inst.out is not None:
                 id_to_ref[inst.out.id] = inst.out
             new_insts.append(Inst(inst.op, inst.out, remapped_args))
@@ -617,6 +694,8 @@ def _dce(ir: IRModule) -> IRModule:
             _mark(off_ref)
             _mark(val_ref)
             _mark(mask_ref)
+        elif inst.op == "barrier":
+            pass
         elif inst.op == "arange":
             # Keep arange even if its SSA result is unused: it defines threadgroup_size.
             assert inst.out is not None
@@ -640,7 +719,7 @@ def _dce(ir: IRModule) -> IRModule:
 
     new_insts: list[Inst] = []
     for inst in ir.insts:
-        if inst.op in {"arg", "store", "arange"}:
+        if inst.op in {"arg", "store", "arange", "barrier"}:
             new_insts.append(inst)
             continue
         if inst.out is None:

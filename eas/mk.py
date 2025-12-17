@@ -74,8 +74,28 @@ def program_id(axis: int) -> val:
     return _b().program_id(axis)
 
 
+def local_id(axis: int) -> val:
+    return _b().local_id(axis)
+
+
+def lane_id() -> val:
+    return _b().lane_id()
+
+
+def sg_id() -> val:
+    return _b().sg_id()
+
+
 def arange(start: int, size: int) -> val:
     return _b().arange(start, size)
+
+
+def alloc_tg(size: int) -> val:
+    return _b().alloc_tg(size)
+
+
+def barrier() -> None:
+    _b().barrier()
 
 
 def load(buffer: Any, offset: Any, mask: Any | None = None) -> val:
@@ -92,3 +112,11 @@ def where(cond: Any, a: Any, b: Any) -> val:
 
 def fma(a: Any, b: Any, c: Any) -> val:
     return _b().fma(a, b, c)
+
+
+def to_f32(x: Any) -> val:
+    return _b().cast(x, DType.F32)
+
+
+def to_u32(x: Any) -> val:
+    return _b().cast(x, DType.U32)
