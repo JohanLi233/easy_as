@@ -575,10 +575,151 @@ def compile(
 def _optimize_ir(ir: IRModule) -> IRModule:
     ir = _rewrite_thread_id(ir)
     ir = _fuse_fma(ir)
+    ir = _fold_static_lts(ir)
     ir = _simplify_bools(ir)
     ir = _cse_pure(ir)
     ir = _dce(ir)
     return ir
+
+
+def _fold_static_lts(ir: IRModule) -> IRModule:
+    """
+    Tiny interval pass to fold lt() to constants for common patterns like:
+
+      tid = arange(0, NT)              => tid in [0, NT-1]
+      a_idx = tid + CONST_I            => a_idx in [I, I+NT-1]
+      in_tile = a_idx < CONST_LIMIT    => can be always-true/false
+
+    This is intentionally *not* a general solver; it's just enough to remove
+    "in_tile" masks that are provably constant.
+    """
+
+    def_by_id: dict[int, Inst] = {}
+    for inst in ir.insts:
+        if inst.out is not None:
+            def_by_id[inst.out.id] = inst
+
+    inferred_threadgroup_size: int | None = None
+    for inst in ir.insts:
+        if inst.op == "arange":
+            size = int(inst.args[1])
+            if inferred_threadgroup_size is None:
+                inferred_threadgroup_size = size
+            elif inferred_threadgroup_size != size:
+                inferred_threadgroup_size = None
+                break
+
+    Interval = tuple[int, int]  # inclusive [lo, hi]
+    interval_by_id: dict[int, Interval] = {}
+
+    def _interval(ref: ValueRef) -> Interval | None:
+        return interval_by_id.get(ref.id)
+
+    def _const_int(ref: ValueRef) -> int | None:
+        inst = def_by_id.get(ref.id)
+        if inst is None or inst.op != "const":
+            return None
+        v = inst.args[0]
+        if isinstance(v, bool):
+            return None
+        if isinstance(v, int):
+            return int(v)
+        return None
+
+    for inst in ir.insts:
+        if inst.out is None:
+            continue
+
+        out = inst.out
+        if inst.op == "const":
+            v = inst.args[0]
+            if isinstance(v, bool):
+                continue
+            if isinstance(v, int):
+                interval_by_id[out.id] = (int(v), int(v))
+            continue
+
+        if inst.op == "arange":
+            start, size = (int(inst.args[0]), int(inst.args[1]))
+            interval_by_id[out.id] = (start, start + size - 1)
+            continue
+
+        if inst.op == "thread_id" and inferred_threadgroup_size is not None:
+            interval_by_id[out.id] = (0, inferred_threadgroup_size - 1)
+            continue
+
+        if inst.op == "add":
+            a_ref, b_ref = inst.args  # type: ignore[misc]
+            if not isinstance(a_ref, ValueRef) or not isinstance(b_ref, ValueRef):
+                continue
+            a_itv = _interval(a_ref)
+            b_itv = _interval(b_ref)
+            if a_itv is None or b_itv is None:
+                continue
+            interval_by_id[out.id] = (a_itv[0] + b_itv[0], a_itv[1] + b_itv[1])
+            continue
+
+        if inst.op == "mul":
+            a_ref, b_ref = inst.args  # type: ignore[misc]
+            if not isinstance(a_ref, ValueRef) or not isinstance(b_ref, ValueRef):
+                continue
+            a_itv = _interval(a_ref)
+            b_itv = _interval(b_ref)
+            if a_itv is not None and b_itv is not None:
+                candidates = (
+                    a_itv[0] * b_itv[0],
+                    a_itv[0] * b_itv[1],
+                    a_itv[1] * b_itv[0],
+                    a_itv[1] * b_itv[1],
+                )
+                interval_by_id[out.id] = (min(candidates), max(candidates))
+                continue
+            a_c = _const_int(a_ref)
+            if a_c is not None and b_itv is not None:
+                candidates = (a_c * b_itv[0], a_c * b_itv[1])
+                interval_by_id[out.id] = (min(candidates), max(candidates))
+                continue
+            b_c = _const_int(b_ref)
+            if b_c is not None and a_itv is not None:
+                candidates = (b_c * a_itv[0], b_c * a_itv[1])
+                interval_by_id[out.id] = (min(candidates), max(candidates))
+                continue
+
+    id_to_ref: dict[int, ValueRef] = {}
+    new_insts: list[Inst] = []
+
+    def _remap(a: Any) -> Any:
+        if isinstance(a, ValueRef):
+            return id_to_ref.get(a.id, a)
+        return a
+
+    for inst in ir.insts:
+        remapped_args = tuple(_remap(a) for a in inst.args)
+
+        if inst.out is None:
+            new_insts.append(Inst(inst.op, None, remapped_args))
+            continue
+
+        out = inst.out
+        if inst.op == "lt" and out.dtype == DType.BOOL:
+            a_ref, b_ref = remapped_args  # type: ignore[misc]
+            if isinstance(a_ref, ValueRef) and isinstance(b_ref, ValueRef):
+                a_itv = _interval(a_ref)
+                b_itv = _interval(b_ref)
+                if a_itv is not None and b_itv is not None:
+                    if a_itv[1] < b_itv[0]:
+                        new_insts.append(Inst("const", out, (True,)))
+                        id_to_ref[out.id] = out
+                        continue
+                    if a_itv[0] >= b_itv[1]:
+                        new_insts.append(Inst("const", out, (False,)))
+                        id_to_ref[out.id] = out
+                        continue
+
+        new_insts.append(Inst(inst.op, out, remapped_args))
+        id_to_ref[out.id] = out
+
+    return IRModule(name=ir.name, args=ir.args, insts=tuple(new_insts))
 
 
 def _simplify_bools(ir: IRModule) -> IRModule:

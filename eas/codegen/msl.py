@@ -60,6 +60,7 @@ def ir_to_msl(ir: IRModule) -> tuple[str, int]:
     arg_names: dict[int, str] = {}
     uses_store: set[str] = set()
     def_by_id: dict[int, Any] = {}
+    def_inst_idx_by_value_id: dict[int, int] = {}
 
     def _has_barrier_or_threadgroup_memory() -> bool:
         """
@@ -114,6 +115,10 @@ def ir_to_msl(ir: IRModule) -> tuple[str, int]:
         elif inst.out is not None:
             def_by_id[inst.out.id] = inst
 
+    for idx, inst in enumerate(ir.insts):
+        if inst.out is not None:
+            def_inst_idx_by_value_id[inst.out.id] = idx
+
     ctx = _Ctx(arg_names=arg_names, uses_store=uses_store)
 
     threadgroup_size = _infer_threadgroup_size(ir)
@@ -123,6 +128,9 @@ def ir_to_msl(ir: IRModule) -> tuple[str, int]:
         for a in inst.args:
             if isinstance(a, ValueRef):
                 use_counts[a.id] = use_counts.get(a.id, 0) + 1
+
+    inline_bool_ids: set[int] = set()
+    inline_bool_expr_by_id: dict[int, str] = {}
 
     def _is_const_bool(v: ValueRef, expected: bool) -> bool:
         inst = def_by_id.get(v.id)
@@ -142,6 +150,107 @@ def ir_to_msl(ir: IRModule) -> tuple[str, int]:
         if v.dtype != DType.U32:
             return None
         return int(inst.args[0])
+
+    def _const_int(v: ValueRef) -> int | None:
+        inst = def_by_id.get(v.id)
+        if inst is None or inst.op != "const":
+            return None
+        if not isinstance(inst.args[0], int):
+            return None
+        return int(inst.args[0])
+
+    def _buf_addr_space(buf: ValueRef) -> str | None:
+        inst = def_by_id.get(buf.id)
+        if inst is None:
+            return None
+        if inst.op == "arg":
+            # kind is arg.args[1], but both scalar/buffer use buffer(index) space;
+            # only buffer args can appear as load/store/dot buffers.
+            return "device"
+        if inst.op == "alloc_tg":
+            return "threadgroup"
+        return None
+
+    def _base_plus_const(ref: ValueRef) -> tuple[ValueRef, int] | None:
+        """
+        Match `ref = add(base, const)` (commuted by CSE) and return (base, const).
+        """
+        inst = def_by_id.get(ref.id)
+        if inst is None or inst.op != "add":
+            return None
+        a, b = inst.args  # type: ignore[misc]
+        if not isinstance(a, ValueRef) or not isinstance(b, ValueRef):
+            return None
+        a_c = _const_int(a)
+        b_c = _const_int(b)
+        if a_c is not None and b_c is None:
+            return (b, a_c)
+        if b_c is not None and a_c is None:
+            return (a, b_c)
+        return None
+
+    def _try_inline_bool_expr(v: ValueRef) -> tuple[str, set[int]] | None:
+        """
+        Inline small boolean expression trees for masks/guards.
+
+        This is used to turn nested `where(...)`-lowered boolean trees into a
+        single `&&` / `||` / `!` expression in MSL, reducing temporary bool SSA
+        values and register pressure.
+        """
+        if v.dtype != DType.BOOL:
+            return None
+        if use_counts.get(v.id, 0) != 1:
+            return None
+        inst = def_by_id.get(v.id)
+        if inst is None:
+            return None
+        if inst.op == "const" and isinstance(inst.args[0], bool):
+            return ("true" if bool(inst.args[0]) else "false", {v.id})
+        if inst.op == "lt":
+            a, b = inst.args  # type: ignore[misc]
+            assert isinstance(a, ValueRef) and isinstance(b, ValueRef)
+            return (f"({_ref(ctx, a)} < {_ref(ctx, b)})", {v.id})
+        if inst.op in {"and", "or"}:
+            a, b = inst.args  # type: ignore[misc]
+            assert isinstance(a, ValueRef) and isinstance(b, ValueRef)
+            a_expr = _try_inline_bool_expr(a)
+            b_expr = _try_inline_bool_expr(b)
+            op = "&&" if inst.op == "and" else "||"
+            expr = f"({(a_expr[0] if a_expr else _ref(ctx, a))} {op} {(b_expr[0] if b_expr else _ref(ctx, b))})"
+            ids: set[int] = {v.id}
+            if a_expr is not None:
+                ids |= a_expr[1]
+            if b_expr is not None:
+                ids |= b_expr[1]
+            return (expr, ids)
+        if inst.op == "not":
+            (x,) = inst.args  # type: ignore[misc]
+            assert isinstance(x, ValueRef)
+            x_expr = _try_inline_bool_expr(x)
+            expr = f"(!{(x_expr[0] if x_expr else _ref(ctx, x))})"
+            ids = {v.id}
+            if x_expr is not None:
+                ids |= x_expr[1]
+            return (expr, ids)
+        return None
+
+    def _mask_expr(v: ValueRef) -> str:
+        return inline_bool_expr_by_id.get(v.id, _ref(ctx, v))
+
+    # Precompute inlined expressions for store/load masks so we can also skip
+    # emitting the intermediate boolean SSA values.
+    for inst in ir.insts:
+        if inst.op not in {"load", "store"}:
+            continue
+        mask_ref: ValueRef = inst.args[2] if inst.op == "load" else inst.args[3]  # type: ignore[assignment,misc]
+        if _is_const_bool(mask_ref, True):
+            continue
+        inlined = _try_inline_bool_expr(mask_ref)
+        if inlined is None:
+            continue
+        expr, ids = inlined
+        inline_bool_expr_by_id[mask_ref.id] = expr
+        inline_bool_ids.update(ids)
 
     def _lifted_region_by_store_idx() -> dict[int, list[int]]:
         def_idx: dict[int, int] = {}
@@ -498,7 +607,7 @@ def ir_to_msl(ir: IRModule) -> tuple[str, int]:
             else:
                 lines.append(f"{indent}{out_ty} v{out.id} = {zero};")
                 lines.append(
-                    f"{indent}if ({_ref(ctx, mask_ref)}) {{ v{out.id} = {buf_name}[{_ref(ctx, off_ref)}]; }}"
+                    f"{indent}if ({_mask_expr(mask_ref)}) {{ v{out.id} = {buf_name}[{_ref(ctx, off_ref)}]; }}"
                 )
             return
         if inst.op == "dot":
@@ -597,7 +706,7 @@ def ir_to_msl(ir: IRModule) -> tuple[str, int]:
                 )
             else:
                 lines.append(
-                    f"{indent}if ({_ref(ctx, mask_ref)}) {{ {buf_name}[{_ref(ctx, off_ref)}] = {_ref(ctx, val_ref)}; }}"
+                    f"{indent}if ({_mask_expr(mask_ref)}) {{ {buf_name}[{_ref(ctx, off_ref)}] = {_ref(ctx, val_ref)}; }}"
                 )
             return
         if inst.op == "barrier":
@@ -661,9 +770,8 @@ def ir_to_msl(ir: IRModule) -> tuple[str, int]:
 
         a_idx_name = f"a_idx{inst0.out.id}"
         lines.append(f"{indent}uint {a_idx_name} = {_ref(ctx, a_base0)};")
-        b_idx_vars: list[str] = []
+        b_bases: list[ValueRef] = []
         for inst in group:
-            assert inst.out is not None
             (
                 _a_buf,
                 _a_base,
@@ -673,9 +781,47 @@ def ir_to_msl(ir: IRModule) -> tuple[str, int]:
                 _b_stride,
                 _k_ref,
             ) = inst.args  # type: ignore[misc]
+            assert isinstance(b_base, ValueRef)
+            b_bases.append(b_base)
+
+        # Try to vectorize 4 contiguous B loads via packed_float4.
+        vec4_idxs: dict[int, int] = {}  # group index -> lane 0..3
+        vec4_base: ValueRef | None = None
+        if b_buf0.dtype == DType.F32 and len(group) >= 4:
+            candidates: list[tuple[int, ValueRef, int]] = []
+            for gi, b_base in enumerate(b_bases):
+                if gi >= 4:
+                    break
+                m = _base_plus_const(b_base)
+                if m is None:
+                    # allow "base + 0" to be represented as base directly
+                    candidates.append((gi, b_base, 0))
+                    continue
+                base_ref, off = m
+                candidates.append((gi, base_ref, off))
+            base0 = candidates[0][1]
+            offsets = [off for (_gi, base, off) in candidates if base.id == base0.id]
+            if len(offsets) == 4 and sorted(offsets) == [0, 1, 2, 3]:
+                vec4_base = base0
+                for gi, base, off in candidates:
+                    if base.id == base0.id and 0 <= off <= 3:
+                        vec4_idxs[gi] = off
+
+        b_idx_vars: list[str] = []
+        b_idx0_name: str | None = None
+        for gi, inst in enumerate(group):
+            assert inst.out is not None
             b_idx = f"b_idx{inst.out.id}"
             b_idx_vars.append(b_idx)
-            lines.append(f"{indent}uint {b_idx} = {_ref(ctx, b_base)};")
+            if vec4_base is not None and gi in vec4_idxs:
+                if b_idx0_name is None:
+                    b_idx0_name = b_idx
+                    lines.append(f"{indent}uint {b_idx0_name} = {_ref(ctx, vec4_base)};")
+                else:
+                    # re-use the same index var for vectorized lanes
+                    lines.append(f"{indent}uint {b_idx} = {b_idx0_name};")
+            else:
+                lines.append(f"{indent}uint {b_idx} = {_ref(ctx, b_bases[gi])};")
 
         k_const = _const_u32(k_ref0)
         if k_const is not None and 1 <= k_const <= 32:
@@ -684,24 +830,203 @@ def ir_to_msl(ir: IRModule) -> tuple[str, int]:
             f"{indent}for (uint {k_var} = 0; {k_var} < {k_name}; ++{k_var}) {{"
         )
         lines.append(f"{indent}  float a_val = {a_name}[{a_idx_name}];")
-        for inst, b_idx in zip(group, b_idx_vars, strict=True):
-            assert inst.out is not None
+        if vec4_base is not None and b_idx0_name is not None and vec4_idxs:
+            space = _buf_addr_space(b_buf0) or "device"
             lines.append(
-                f"{indent}  v{inst.out.id} = fma(a_val, {b_name}[{b_idx}], v{inst.out.id});"
+                f"{indent}  packed_float4 b_pack = *(({space} packed_float4*)({b_name} + {b_idx0_name}));"
             )
-            lines.append(f"{indent}  {b_idx} += {_ref(ctx, b_stride0)};")
+            lines.append(
+                f"{indent}  float4 b_vec = float4(b_pack.x, b_pack.y, b_pack.z, b_pack.w);"
+            )
+            for gi, (inst, b_idx) in enumerate(zip(group, b_idx_vars, strict=True)):
+                assert inst.out is not None
+                lane = vec4_idxs.get(gi)
+                if lane is None:
+                    lines.append(
+                        f"{indent}  v{inst.out.id} = fma(a_val, {b_name}[{b_idx}], v{inst.out.id});"
+                    )
+                else:
+                    comp = ["x", "y", "z", "w"][lane]
+                    lines.append(
+                        f"{indent}  v{inst.out.id} = fma(a_val, b_vec.{comp}, v{inst.out.id});"
+                    )
+            for gi, b_idx in enumerate(b_idx_vars):
+                # Update vectorized lanes only once (they alias b_idx0_name).
+                if vec4_base is not None and gi in vec4_idxs:
+                    if b_idx == b_idx0_name:
+                        lines.append(f"{indent}  {b_idx0_name} += {_ref(ctx, b_stride0)};")
+                else:
+                    lines.append(f"{indent}  {b_idx} += {_ref(ctx, b_stride0)};")
+        else:
+            for inst, b_idx in zip(group, b_idx_vars, strict=True):
+                assert inst.out is not None
+                lines.append(
+                    f"{indent}  v{inst.out.id} = fma(a_val, {b_name}[{b_idx}], v{inst.out.id});"
+                )
+                lines.append(f"{indent}  {b_idx} += {_ref(ctx, b_stride0)};")
         lines.append(f"{indent}  {a_idx_name} += {_ref(ctx, a_stride0)};")
         lines.append(f"{indent}}}")
         return len(group)
 
+    skipped_inst_idxs: set[int] = set()
+
+    def _try_emit_dot_tn4_group(start_idx: int, *, indent: str) -> bool:
+        """
+        Fuse 4 dots that share the same A/B pointers/strides/K and whose B bases
+        are contiguous (base + 0/1/2/3), emitting one loop that loads B via a
+        single packed_float4 per k.
+
+        This targets the matmul TN=4 pattern even when the 4 `dot` insts are not
+        contiguous in the IR (due to intervening add/const instructions).
+        """
+        if start_idx in skipped_inst_idxs:
+            return False
+        inst0 = ir.insts[start_idx]
+        if inst0.op != "dot" or inst0.out is None:
+            return False
+
+        (
+            a_buf0,
+            a_base0,
+            a_stride0,
+            b_buf0,
+            b_base0,
+            b_stride0,
+            k_ref0,
+        ) = inst0.args  # type: ignore[misc]
+        if not (
+            isinstance(a_buf0, ValueRef)
+            and isinstance(a_base0, ValueRef)
+            and isinstance(a_stride0, ValueRef)
+            and isinstance(b_buf0, ValueRef)
+            and isinstance(b_base0, ValueRef)
+            and isinstance(b_stride0, ValueRef)
+            and isinstance(k_ref0, ValueRef)
+        ):
+            return False
+        if b_buf0.dtype != DType.F32:
+            return False
+
+        def _sig(inst: Any) -> tuple[int, int, int, int, int, int]:
+            (
+                a_buf,
+                a_base,
+                a_stride,
+                b_buf,
+                _b_base,
+                b_stride,
+                k_ref,
+            ) = inst.args  # type: ignore[misc]
+            return (
+                a_buf.id,
+                a_base.id,
+                a_stride.id,
+                b_buf.id,
+                b_stride.id,
+                k_ref.id,
+            )
+
+        sig0 = _sig(inst0)
+        m0 = _base_plus_const(b_base0)
+        base0, off0 = (m0[0], m0[1]) if m0 is not None else (b_base0, 0)
+        if off0 != 0:
+            return False
+
+        found: dict[int, int] = {0: start_idx}  # off -> inst idx
+        scan_limit = min(len(ir.insts), start_idx + 64)
+        for j in range(start_idx + 1, scan_limit):
+            if j in skipped_inst_idxs:
+                continue
+            inst = ir.insts[j]
+            if inst.op in {"store", "barrier", "mma", "mma_store"}:
+                break
+            if inst.op != "dot" or inst.out is None:
+                continue
+            if _sig(inst) != sig0:
+                continue
+            _a_buf, _a_base, _a_stride, _b_buf, b_base, _b_stride, _k_ref = inst.args  # type: ignore[misc]
+            if not isinstance(b_base, ValueRef):
+                continue
+            m = _base_plus_const(b_base)
+            base, off = (m[0], m[1]) if m is not None else (b_base, 0)
+            if base.id != base0.id:
+                continue
+            if off in {0, 1, 2, 3} and off not in found:
+                found[off] = j
+                if len(found) == 4:
+                    break
+
+        if set(found.keys()) != {0, 1, 2, 3}:
+            return False
+
+        # Skip emitting the other 3 dot insts; also skip their `add(base, const)`
+        # b_base defs when they are single-use.
+        for off in (1, 2, 3):
+            dot_idx = found[off]
+            skipped_inst_idxs.add(dot_idx)
+            inst = ir.insts[dot_idx]
+            b_base: ValueRef = inst.args[4]  # type: ignore[assignment,misc]
+            add_def_idx = def_inst_idx_by_value_id.get(b_base.id)
+            if add_def_idx is not None and use_counts.get(b_base.id, 0) == 1:
+                add_def = ir.insts[add_def_idx]
+                if add_def.op == "add":
+                    skipped_inst_idxs.add(add_def_idx)
+
+        # Emit fused loop.
+        insts_by_off = [ir.insts[found[i]] for i in (0, 1, 2, 3)]
+        out_ids = [inst.out.id for inst in insts_by_off]  # type: ignore[union-attr]
+
+        a_name = _ref(ctx, a_buf0)
+        b_name = _ref(ctx, b_buf0)
+        k_name = _ref(ctx, k_ref0)
+        k_var = f"k{out_ids[0]}"
+        a_idx_name = f"a_idx{out_ids[0]}"
+        b_idx_name = f"b_idx{out_ids[0]}"
+
+        for out_id in out_ids:
+            lines.append(f"{indent}float v{out_id} = 0.0f;")
+
+        lines.append(f"{indent}uint {a_idx_name} = {_ref(ctx, a_base0)};")
+        lines.append(f"{indent}uint {b_idx_name} = {_ref(ctx, base0)};")
+
+        k_const = _const_u32(k_ref0)
+        if k_const is not None and 1 <= k_const <= 32:
+            lines.append(f"{indent}#pragma clang loop unroll_count({k_const})")
+        lines.append(
+            f"{indent}for (uint {k_var} = 0; {k_var} < {k_name}; ++{k_var}) {{"
+        )
+        lines.append(f"{indent}  float a_val = {a_name}[{a_idx_name}];")
+        space = _buf_addr_space(b_buf0) or "device"
+        lines.append(
+            f"{indent}  packed_float4 b_pack = *(({space} packed_float4*)({b_name} + {b_idx_name}));"
+        )
+        lines.append(
+            f"{indent}  float4 b_vec = float4(b_pack.x, b_pack.y, b_pack.z, b_pack.w);"
+        )
+        comps = ["x", "y", "z", "w"]
+        for out_id, comp in zip(out_ids, comps, strict=True):
+            lines.append(
+                f"{indent}  v{out_id} = fma(a_val, b_vec.{comp}, v{out_id});"
+            )
+        lines.append(f"{indent}  {b_idx_name} += {_ref(ctx, b_stride0)};")
+        lines.append(f"{indent}  {a_idx_name} += {_ref(ctx, a_stride0)};")
+        lines.append(f"{indent}}}")
+        return True
+
     idx = 0
     while idx < len(ir.insts):
         inst = ir.insts[idx]
+        if idx in skipped_inst_idxs:
+            idx += 1
+            continue
         if (
             inst.out is not None
             and use_counts.get(inst.out.id, 0) == 0
             and inst.op != "store"
         ):
+            idx += 1
+            continue
+        if inst.out is not None and inst.out.id in inline_bool_ids:
             idx += 1
             continue
         if idx in moved_inst_idxs or idx in alloc_tg_inst_idxs:
@@ -712,7 +1037,10 @@ def ir_to_msl(ir: IRModule) -> tuple[str, int]:
             continue
 
         if inst.op == "dot":
-            idx += _emit_dot_group(idx, indent="  ")
+            if _try_emit_dot_tn4_group(idx, indent="  "):
+                idx += 1
+            else:
+                idx += _emit_dot_group(idx, indent="  ")
             continue
 
         if inst.op == "store" and idx in lifted_by_store:
@@ -722,14 +1050,14 @@ def ir_to_msl(ir: IRModule) -> tuple[str, int]:
                 and isinstance(mask_ref, ValueRef)
                 and not _is_const_bool(mask_ref, True)
             ):
-                lines.append(f"  if (!{_ref(ctx, mask_ref)}) return;")
+                lines.append(f"  if (!{_mask_expr(mask_ref)}) return;")
                 for moved_idx in lifted_by_store[idx]:
                     _emit_inst(
                         ir.insts[moved_idx], indent="  ", in_guard_for_mask=mask_ref
                     )
                 _emit_inst(inst, indent="  ", in_guard_for_mask=mask_ref)
             else:
-                lines.append(f"  if ({_ref(ctx, mask_ref)}) {{")
+                lines.append(f"  if ({_mask_expr(mask_ref)}) {{")
                 for moved_idx in lifted_by_store[idx]:
                     _emit_inst(
                         ir.insts[moved_idx], indent="    ", in_guard_for_mask=mask_ref
@@ -746,7 +1074,7 @@ def ir_to_msl(ir: IRModule) -> tuple[str, int]:
                 and not _is_const_bool(mask_ref, True)
                 and allow_early_return
             ):
-                lines.append(f"  if (!{_ref(ctx, mask_ref)}) return;")
+                lines.append(f"  if (!{_mask_expr(mask_ref)}) return;")
                 _emit_inst(inst, indent="  ", in_guard_for_mask=mask_ref)
             else:
                 _emit_inst(inst, indent="  ", in_guard_for_mask=None)

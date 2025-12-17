@@ -131,9 +131,3 @@ uv run python -m unittest discover -s tests -p "test*.py" -v
 source .venv/bin/activate
 python -m examples.add
 ```
-
-## 文档
-
-- `docs/ARCHITECTURE.md`
-- `docs/ROADMAP.md`
-- `docs/TORCH_INTEGRATION.md`

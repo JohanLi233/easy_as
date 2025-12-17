@@ -31,6 +31,8 @@ def matmul_tiled_kernel(
     c,
     M,
     N,
+    PID_M_BASE,
+    PID_N_BASE,
     BM: eas.constexpr,
     BN: eas.constexpr,
     BK: eas.constexpr,
@@ -48,8 +50,8 @@ def matmul_tiled_kernel(
       - uses threadgroup memory: As[BM*BK], Bs[BK*BN]
     """
 
-    pid_n = mk.program_id(0)  # tile along N
-    pid_m = mk.program_id(1)  # tile along M
+    pid_n = mk.program_id(0) + PID_N_BASE  # tile along N
+    pid_m = mk.program_id(1) + PID_M_BASE  # tile along M
     tid = mk.arange(0, NT)  # 0..NT-1
 
     tn = 4
@@ -63,8 +65,10 @@ def matmul_tiled_kernel(
     rm = tid // ng
     cg = tid % ng
 
-    row = pid_m * BM + rm
-    col0 = pid_n * BN + cg * tn
+    tile_m = pid_m * BM
+    tile_n = pid_n * BN
+    row = tile_m + rm
+    col0 = tile_n + cg * tn
 
     As = mk.alloc_tg(BM * lda)
     Bs = mk.alloc_tg(BK * ldb)
@@ -74,6 +78,9 @@ def matmul_tiled_kernel(
     acc2 = 0.0
     acc3 = 0.0
 
+    row_ok = row < M
+    c_row_base = row * N
+
     for k0 in range(0, K, BK):
         # ---- load As ----
         for i in range(0, BM * BK, NT):
@@ -82,10 +89,10 @@ def matmul_tiled_kernel(
             a_r = a_idx // BK
             a_c = a_idx % BK
             as_off = a_r * lda + a_c
-            a_row = pid_m * BM + a_r
-            a_col = k0 + a_c
-            a_mask = mk.where(in_tile, mk.where(a_row < M, a_col < K, False), False)
-            a_off = a_row * K + a_col
+            a_row = tile_m + a_r
+            a_row_base = a_row * K + k0
+            a_off = a_row_base + a_c
+            a_mask = in_tile & (a_row < M) & ((k0 + a_c) < K)
             mk.store(As, as_off, mk.load(a, a_off, a_mask), in_tile)
 
         # ---- load Bs ----
@@ -95,10 +102,9 @@ def matmul_tiled_kernel(
             b_r = b_idx // BN
             b_c = b_idx % BN
             bs_off = b_r * ldb + b_c
-            b_row = k0 + b_r
-            b_col = pid_n * BN + b_c
-            b_mask = mk.where(in_tile, mk.where(b_row < K, b_col < N, False), False)
-            b_off = b_row * N + b_col
+            b_row_base = (k0 + b_r) * N + tile_n
+            b_off = b_row_base + b_c
+            b_mask = in_tile & ((k0 + b_r) < K) & ((tile_n + b_c) < N)
             mk.store(Bs, bs_off, mk.load(b, b_off, b_mask), in_tile)
 
         mk.barrier()
@@ -118,12 +124,11 @@ def matmul_tiled_kernel(
         mk.barrier()
 
     # ---- store ----
-    base = row * N + col0
-    row_ok = row < M
-    mk.store(c, base + 0, acc0, mk.where(row_ok, col0 + 0 < N, False))
-    mk.store(c, base + 1, acc1, mk.where(row_ok, col0 + 1 < N, False))
-    mk.store(c, base + 2, acc2, mk.where(row_ok, col0 + 2 < N, False))
-    mk.store(c, base + 3, acc3, mk.where(row_ok, col0 + 3 < N, False))
+    base = c_row_base + col0
+    mk.store(c, base + 0, acc0, row_ok & (col0 + 0 < N))
+    mk.store(c, base + 1, acc1, row_ok & (col0 + 1 < N))
+    mk.store(c, base + 2, acc2, row_ok & (col0 + 2 < N))
+    mk.store(c, base + 3, acc3, row_ok & (col0 + 3 < N))
 
 
 @eas.kernel
@@ -169,8 +174,10 @@ def matmul_tiled_full_kernel(
     rm = tid // ng
     cg = tid % ng
 
-    row = pid_m * BM + rm
-    col0 = pid_n * BN + cg * tn
+    tile_m = pid_m * BM
+    tile_n = pid_n * BN
+    row = tile_m + rm
+    col0 = tile_n + cg * tn
 
     As = mk.alloc_tg(BM * lda)
     Bs = mk.alloc_tg(BK * ldb)
@@ -179,6 +186,7 @@ def matmul_tiled_full_kernel(
     acc1 = 0.0
     acc2 = 0.0
     acc3 = 0.0
+    c_row_base = row * N
 
     for k0 in range(0, K, BK):
         for i in range(0, BM * BK, NT):
@@ -186,9 +194,9 @@ def matmul_tiled_full_kernel(
             a_r = a_idx // BK
             a_c = a_idx % BK
             as_off = a_r * lda + a_c
-            a_row = pid_m * BM + a_r
-            a_col = k0 + a_c
-            a_off = a_row * K + a_col
+            a_row = tile_m + a_r
+            a_row_base = a_row * K + k0
+            a_off = a_row_base + a_c
             mk.store(As, as_off, mk.load(a, a_off, True), True)
 
         for i in range(0, BK * BN, NT):
@@ -196,9 +204,8 @@ def matmul_tiled_full_kernel(
             b_r = b_idx // BN
             b_c = b_idx % BN
             bs_off = b_r * ldb + b_c
-            b_row = k0 + b_r
-            b_col = pid_n * BN + b_c
-            b_off = b_row * N + b_col
+            b_row_base = (k0 + b_r) * N + tile_n
+            b_off = b_row_base + b_c
             mk.store(Bs, bs_off, mk.load(b, b_off, True), True)
 
         mk.barrier()
@@ -216,7 +223,7 @@ def matmul_tiled_full_kernel(
 
         mk.barrier()
 
-    base = row * N + col0
+    base = c_row_base + col0
     mk.store(c, base + 0, acc0, True)
     mk.store(c, base + 1, acc1, True)
     mk.store(c, base + 2, acc2, True)
@@ -295,40 +302,107 @@ def main(argv: list[str] | None = None) -> None:
     b = b2.reshape(-1)
     c = c2.reshape(-1)
 
-    grid = lambda meta, rargs: (  # noqa: E731
-        _cdiv(int(rargs["N"]), int(meta["BN"])),
-        _cdiv(int(rargs["M"]), int(meta["BM"])),
-        1,
-    )
-
-    fast_path = (
-        (m % bm == 0)
-        and (n % bn == 0)
+    gx_all = _cdiv(n, bn)
+    gy_all = _cdiv(m, bm)
+    gx_full = n // bn
+    gy_full = m // bm
+    has_full = (
+        gx_full > 0
+        and gy_full > 0
         and (k % bk == 0)
         and ((bm * bk) % nt == 0)
         and ((bk * bn) % nt == 0)
     )
-    kernel = matmul_tiled_full_kernel if fast_path else matmul_tiled_kernel
-    if fast_path:
-        print("fast_path=1 (full tiles, unmasked loads/stores)")
+    if k % bk != 0:
+        print("k_tail=1 -> masked only (TODO: BK_tail kernel)")
+    elif has_full:
+        print("has_full=1 -> full kernel for interior tiles, masked kernel for edges")
     else:
-        print("fast_path=0 (masked loads/stores)")
+        print("has_full=0 -> masked only")
+
+    def _launch_masked(
+        *,
+        grid_x: int,
+        grid_y: int,
+        pid_n_base: int,
+        pid_m_base: int,
+        sync: bool,
+    ) -> None:
+        if grid_x <= 0 or grid_y <= 0:
+            return
+        matmul_tiled_kernel(
+            a,
+            b,
+            c,
+            m,
+            n,
+            pid_m_base,
+            pid_n_base,
+            BM=bm,
+            BN=bn,
+            BK=bk,
+            K=k,
+            NT=nt,
+            _grid=(grid_x, grid_y, 1),
+            _tptg=(nt, 1, 1),
+            _sync=sync,
+        )
+
+    def _launch_full(*, sync: bool) -> None:
+        if not has_full:
+            return
+        matmul_tiled_full_kernel(
+            a,
+            b,
+            c,
+            m,
+            n,
+            BM=bm,
+            BN=bn,
+            BK=bk,
+            K=k,
+            NT=nt,
+            _grid=(gx_full, gy_full, 1),
+            _tptg=(nt, 1, 1),
+            _sync=sync,
+        )
+
+    def _launch_all(*, sync: bool) -> None:
+        if k % bk != 0 or not has_full:
+            _launch_masked(
+                grid_x=gx_all, grid_y=gy_all, pid_n_base=0, pid_m_base=0, sync=sync
+            )
+            return
+
+        has_edges = (gx_all > gx_full) or (gy_all > gy_full)
+        _launch_full(sync=(sync and not has_edges))
+        # right strip
+        _launch_masked(
+            grid_x=gx_all - gx_full,
+            grid_y=gy_full,
+            pid_n_base=gx_full,
+            pid_m_base=0,
+            sync=False,
+        )
+        # bottom strip
+        _launch_masked(
+            grid_x=gx_full,
+            grid_y=gy_all - gy_full,
+            pid_n_base=0,
+            pid_m_base=gy_full,
+            sync=False,
+        )
+        # bottom-right corner
+        _launch_masked(
+            grid_x=gx_all - gx_full,
+            grid_y=gy_all - gy_full,
+            pid_n_base=gx_full,
+            pid_m_base=gy_full,
+            sync=sync,
+        )
 
     # Correctness + compile
-    kernel(
-        a,
-        b,
-        c,
-        m,
-        n,
-        BM=bm,
-        BN=bn,
-        BK=bk,
-        K=k,
-        NT=nt,
-        _grid=grid,
-        _tptg=(nt, 1, 1),
-    )
+    _launch_all(sync=True)
     if device.type == "mps":
         torch.mps.synchronize()
     expected = a2 @ b2
@@ -342,22 +416,99 @@ def main(argv: list[str] | None = None) -> None:
     print(f"OK（正确性验证，设备={device}，tile=({bm},{bn},{bk}), nt={nt})")
 
     if args.print_msl:
-        print(
-            kernel.to_msl(
-                a,
-                b,
-                c,
-                m,
-                n,
-                BM=bm,
-                BN=bn,
-                BK=bk,
-                K=k,
-                NT=nt,
-                _grid=grid,
-                _tptg=(nt, 1, 1),
+        if k % bk != 0 or not has_full:
+            print(
+                matmul_tiled_kernel.to_msl(
+                    a,
+                    b,
+                    c,
+                    m,
+                    n,
+                    0,
+                    0,
+                    BM=bm,
+                    BN=bn,
+                    BK=bk,
+                    K=k,
+                    NT=nt,
+                    _grid=(gx_all, gy_all, 1),
+                    _tptg=(nt, 1, 1),
+                )
             )
-        )
+        else:
+            print(
+                matmul_tiled_full_kernel.to_msl(
+                    a,
+                    b,
+                    c,
+                    m,
+                    n,
+                    BM=bm,
+                    BN=bn,
+                    BK=bk,
+                    K=k,
+                    NT=nt,
+                    _grid=(gx_full, gy_full, 1),
+                    _tptg=(nt, 1, 1),
+                )
+            )
+            if gx_all > gx_full and gy_full > 0:
+                print(
+                    matmul_tiled_kernel.to_msl(
+                        a,
+                        b,
+                        c,
+                        m,
+                        n,
+                        0,
+                        gx_full,
+                        BM=bm,
+                        BN=bn,
+                        BK=bk,
+                        K=k,
+                        NT=nt,
+                        _grid=(gx_all - gx_full, gy_full, 1),
+                        _tptg=(nt, 1, 1),
+                    )
+                )
+            if gx_full > 0 and gy_all > gy_full:
+                print(
+                    matmul_tiled_kernel.to_msl(
+                        a,
+                        b,
+                        c,
+                        m,
+                        n,
+                        gy_full,
+                        0,
+                        BM=bm,
+                        BN=bn,
+                        BK=bk,
+                        K=k,
+                        NT=nt,
+                        _grid=(gx_full, gy_all - gy_full, 1),
+                        _tptg=(nt, 1, 1),
+                    )
+                )
+            if gx_all > gx_full and gy_all > gy_full:
+                print(
+                    matmul_tiled_kernel.to_msl(
+                        a,
+                        b,
+                        c,
+                        m,
+                        n,
+                        gy_full,
+                        gx_full,
+                        BM=bm,
+                        BN=bn,
+                        BK=bk,
+                        K=k,
+                        NT=nt,
+                        _grid=(gx_all - gx_full, gy_all - gy_full, 1),
+                        _tptg=(nt, 1, 1),
+                    )
+                )
 
     if hasattr(runtime, "synchronize"):
         runtime.synchronize()
@@ -367,21 +518,7 @@ def main(argv: list[str] | None = None) -> None:
     # Timings (best-effort)
     t0 = time.perf_counter()
     for _ in range(iters):
-        kernel(
-            a,
-            b,
-            c,
-            m,
-            n,
-            BM=bm,
-            BN=bn,
-            BK=bk,
-            K=k,
-            NT=nt,
-            _grid=grid,
-            _tptg=(nt, 1, 1),
-            _sync=False,
-        )
+        _launch_all(sync=False)
     if hasattr(runtime, "synchronize"):
         runtime.synchronize()
     if device.type == "mps":

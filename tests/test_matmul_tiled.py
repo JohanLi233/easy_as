@@ -100,6 +100,31 @@ def matmul_tiled_kernel_test(
 
 
 class TestMatmulTiled(unittest.TestCase):
+    def test_packed_float4_emitted_for_dot_group(self) -> None:
+        m, n, k = 16, 64, 16
+        bm, bn, bk, nt = 16, 64, 16, 256
+        a2 = np.random.randn(m, k).astype(np.float32)
+        b2 = np.random.randn(k, n).astype(np.float32)
+        c2 = np.zeros((m, n), dtype=np.float32)
+
+        a = a2.reshape(-1)
+        b = b2.reshape(-1)
+        c = c2.reshape(-1)
+
+        ck = matmul_tiled_kernel_test.compile(
+            a,
+            b,
+            c,
+            m,
+            n,
+            BM=bm,
+            BN=bn,
+            BK=bk,
+            K=k,
+            NT=nt,
+        )
+        self.assertIn("packed_float4", ck.msl)
+
     def test_correctness_on_mps_if_available(self) -> None:
         rt = get_runtime("mps")
         if not rt.is_available():
