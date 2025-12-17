@@ -45,6 +45,35 @@ def ir_to_msl(ir: IRModule) -> tuple[str, int]:
     uses_store: set[str] = set()
     def_by_id: dict[int, Any] = {}
 
+    def _has_barrier_or_threadgroup_memory() -> bool:
+        """
+        Conservative check used for early-return lowering.
+
+        Kernels that use threadgroup memory or barriers must not early-return
+        based on a per-thread predicate, otherwise some threads may skip a
+        barrier that other threads reach.
+        """
+
+        barrier_ops = {
+            "barrier",
+            "threadgroup_barrier",
+            "tg_barrier",
+            "simdgroup_barrier",
+        }
+        threadgroup_mem_ops = {
+            "threadgroup_alloc",
+            "alloc_threadgroup",
+            "threadgroup_load",
+            "threadgroup_store",
+            "tgm_load",
+            "tgm_store",
+        }
+        for inst in ir.insts:
+            op = str(inst.op)
+            if op in barrier_ops or op in threadgroup_mem_ops:
+                return True
+        return False
+
     # Extract arg name mapping and store targets.
     for inst in ir.insts:
         if inst.op == "arg":
@@ -201,6 +230,11 @@ def ir_to_msl(ir: IRModule) -> tuple[str, int]:
         return lifted
 
     lifted_by_store = _lifted_region_by_store_idx()
+
+    has_barrier_or_tgmem = _has_barrier_or_threadgroup_memory()
+    store_idxs = [i for i, inst in enumerate(ir.insts) if inst.op == "store"]
+    allow_early_return = len(store_idxs) == 1 and not has_barrier_or_tgmem
+    early_return_store_idx = store_idxs[0] if allow_early_return else None
 
     needs_tgpig = False
     needs_tpitg = False
@@ -376,13 +410,36 @@ def ir_to_msl(ir: IRModule) -> tuple[str, int]:
             continue
         if inst.op == "store" and idx in lifted_by_store:
             _buf_ref, _off_ref, _val_ref, mask_ref = inst.args  # type: ignore[misc]
-            lines.append(f"  if ({_ref(ctx, mask_ref)}) {{")
-            for moved_idx in lifted_by_store[idx]:
-                _emit_inst(
-                    ir.insts[moved_idx], indent="    ", in_guard_for_mask=mask_ref
-                )
-            _emit_inst(inst, indent="    ", in_guard_for_mask=mask_ref)
-            lines.append("  }")
+            if (
+                early_return_store_idx == idx
+                and isinstance(mask_ref, ValueRef)
+                and not _is_const_bool(mask_ref, True)
+            ):
+                lines.append(f"  if (!{_ref(ctx, mask_ref)}) return;")
+                for moved_idx in lifted_by_store[idx]:
+                    _emit_inst(
+                        ir.insts[moved_idx], indent="  ", in_guard_for_mask=mask_ref
+                    )
+                _emit_inst(inst, indent="  ", in_guard_for_mask=mask_ref)
+            else:
+                lines.append(f"  if ({_ref(ctx, mask_ref)}) {{")
+                for moved_idx in lifted_by_store[idx]:
+                    _emit_inst(
+                        ir.insts[moved_idx], indent="    ", in_guard_for_mask=mask_ref
+                    )
+                _emit_inst(inst, indent="    ", in_guard_for_mask=mask_ref)
+                lines.append("  }")
+        elif inst.op == "store" and early_return_store_idx == idx:
+            _buf_ref, _off_ref, _val_ref, mask_ref = inst.args  # type: ignore[misc]
+            if (
+                isinstance(mask_ref, ValueRef)
+                and not _is_const_bool(mask_ref, True)
+                and allow_early_return
+            ):
+                lines.append(f"  if (!{_ref(ctx, mask_ref)}) return;")
+                _emit_inst(inst, indent="  ", in_guard_for_mask=mask_ref)
+            else:
+                _emit_inst(inst, indent="  ", in_guard_for_mask=None)
         else:
             _emit_inst(inst, indent="  ", in_guard_for_mask=None)
 

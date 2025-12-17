@@ -53,6 +53,16 @@ class TestFmaOptimization(unittest.TestCase):
 
         # Check that fma instruction appears
         self.assertIn("fma(", msl, "fma instruction not found in generated MSL")
+        self.assertRegex(
+            msl,
+            r"\bif \(!v\d+\) return;",
+            "expected early-return guard for single-store mask",
+        )
+        self.assertNotRegex(
+            msl,
+            r"\bif \(v\d+\) \{",
+            "expected no if(mask){...} guard after early-return lowering",
+        )
 
         # Check that the pattern a*b + c doesn't appear as separate mul and add
         # (though there might be other unrelated mul/add instructions)
@@ -84,6 +94,16 @@ class TestFmaOptimization(unittest.TestCase):
 
         # 1. Check that fma instructions are generated
         self.assertIn("fma(", msl, "fma instruction not found in matmul MSL")
+        self.assertRegex(
+            msl,
+            r"\bif \(!v\d+\) return;",
+            "expected early-return guard for matmul mask",
+        )
+        self.assertNotRegex(
+            msl,
+            r"\bif \(v\d+\) \{",
+            "expected no if(mask){...} guard after early-return lowering",
+        )
 
         # 2. Check that lift optimization worked (no per-load branches)
         lines = msl.split("\n")
