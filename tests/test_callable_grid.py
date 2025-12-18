@@ -20,7 +20,7 @@ def _cdiv(a: int, b: int) -> int:
 def grid_callable_kernel(out, H, W, BLOCK: eas.constexpr):
     tile = mk.program_id(0)
     row = mk.program_id(1)
-    col = tile * BLOCK + mk.arange(0, BLOCK)
+    col = tile * BLOCK + mk.tid(0, BLOCK)
     off = row * W + col
     mask = mk.where(row < H, col < W, False)
     mk.store(out, off, mk.to_f32(row), mask)

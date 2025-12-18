@@ -15,7 +15,7 @@ from eas.runtime import get_runtime
 @eas.kernel
 def tg_copy_kernel(a, out, N, BLOCK: eas.constexpr):
     pid = mk.program_id(0)
-    tid = mk.arange(0, BLOCK)
+    tid = mk.tid(0, BLOCK)
     offs = pid * BLOCK + tid
     mask = offs < N
 
@@ -30,7 +30,7 @@ def tg_copy_kernel(a, out, N, BLOCK: eas.constexpr):
 @eas.kernel
 def tg_copy_kernel_masked(a, out, N, BLOCK: eas.constexpr):
     pid = mk.program_id(0)
-    tid = mk.arange(0, BLOCK)
+    tid = mk.tid(0, BLOCK)
     offs = pid * BLOCK + tid
     mask = offs < N
 

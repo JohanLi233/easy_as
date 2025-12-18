@@ -12,7 +12,7 @@ from eas import mk
 
 @eas.kernel
 def mma_codegen_kernel(a, b, c, BLOCK: eas.constexpr):
-    tid = mk.arange(0, BLOCK)
+    tid = mk.tid(0, BLOCK)
 
     As = mk.alloc_tg(8 * 8)
     Bs = mk.alloc_tg(8 * 8)

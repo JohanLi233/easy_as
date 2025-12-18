@@ -14,7 +14,7 @@ from eas import mk
 def simple_fma_kernel(a, b, c, d, N, BLOCK: eas.constexpr):
     """a * b + c -> should become fma(a, b, c)"""
     pid = mk.program_id(0)
-    offs = pid * BLOCK + mk.arange(0, BLOCK)
+    offs = pid * BLOCK + mk.tid(0, BLOCK)
     mask = offs < N
     a_val = mk.load(a, offs, mask)
     b_val = mk.load(b, offs, mask)
@@ -28,7 +28,7 @@ def matmul_with_fma(a, b, c, M, N, BLOCK: eas.constexpr, K: eas.constexpr):
     """Matmul kernel where each inner iteration should become fma"""
     row = mk.program_id(0)
     tile = mk.program_id(1)
-    col = tile * BLOCK + mk.arange(0, BLOCK)
+    col = tile * BLOCK + mk.tid(0, BLOCK)
     out = row * N + col
     mask = mk.where(row < M, col < N, False)
     acc = 0.0
@@ -135,7 +135,7 @@ class TestFmaOptimization(unittest.TestCase):
         @eas.kernel
         def multi_use_mul_kernel(a, b, c, d, e, N, BLOCK: eas.constexpr):
             pid = mk.program_id(0)
-            offs = pid * BLOCK + mk.arange(0, BLOCK)
+            offs = pid * BLOCK + mk.tid(0, BLOCK)
             mask = offs < N
             a_val = mk.load(a, offs, mask)
             b_val = mk.load(b, offs, mask)
@@ -187,7 +187,7 @@ class TestFmaOptimization(unittest.TestCase):
         @eas.kernel
         def explicit_fma_kernel(a, b, c, d, N, BLOCK: eas.constexpr):
             pid = mk.program_id(0)
-            offs = pid * BLOCK + mk.arange(0, BLOCK)
+            offs = pid * BLOCK + mk.tid(0, BLOCK)
             mask = offs < N
             a_val = mk.load(a, offs, mask)
             b_val = mk.load(b, offs, mask)

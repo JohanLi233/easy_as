@@ -15,7 +15,7 @@ from eas.runtime import get_runtime
 @eas.kernel
 def gemv_dot_kernel(a, x, y, M, K, N, BLOCK: eas.constexpr):
     pid = mk.program_id(0)
-    offs = pid * BLOCK + mk.arange(0, BLOCK)
+    offs = pid * BLOCK + mk.tid(0, BLOCK)
     row = offs
     mask = row < M
     base = row * K

@@ -13,7 +13,7 @@ from eas import mk
 @eas.kernel
 def dot_f16_scalar_kernel(a, b, out, K, BLOCK: eas.constexpr):
     pid = mk.program_id(0)
-    offs = pid * BLOCK + mk.arange(0, BLOCK)
+    offs = pid * BLOCK + mk.tid(0, BLOCK)
     base = offs * K
     v = mk.dot(a, base, 1, b, 0, 1, K)
     mk.store(out, offs, v, offs < (BLOCK * 2))
@@ -22,7 +22,7 @@ def dot_f16_scalar_kernel(a, b, out, K, BLOCK: eas.constexpr):
 @eas.kernel
 def dot_f16_tn4_kernel(a, b, out, K, BLOCK: eas.constexpr):
     pid = mk.program_id(0)
-    _ = mk.arange(0, BLOCK)
+    _ = mk.tid(0, BLOCK)
     base = pid * 4
     d0 = mk.dot(a, 0, 1, b, base, 1, K)
     d1 = mk.dot(a, 0, 1, b, base + 1, 1, K)

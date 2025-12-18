@@ -16,7 +16,7 @@ from eas.runtime.grid import infer_grid
 def add2d_hw_kernel(a, b, c, H, W, BLOCK: eas.constexpr):
     tile = mk.program_id(0)
     row = mk.program_id(1)
-    col = tile * BLOCK + mk.arange(0, BLOCK)
+    col = tile * BLOCK + mk.tid(0, BLOCK)
     offs = row * W + col
     mask = mk.where(row < H, col < W, False)
     mk.store(c, offs, mk.load(a, offs, mask) + mk.load(b, offs, mask), mask)
@@ -26,7 +26,7 @@ def add2d_hw_kernel(a, b, c, H, W, BLOCK: eas.constexpr):
 def add2d_shape_kernel(a, b, c, M, N, BLOCK: eas.constexpr):
     tile = mk.program_id(0)
     row = mk.program_id(1)
-    col = tile * BLOCK + mk.arange(0, BLOCK)
+    col = tile * BLOCK + mk.tid(0, BLOCK)
     offs = row * N + col
     mask = mk.where(row < M, col < N, False)
     mk.store(c, offs, mk.load(a, offs, mask) + mk.load(b, offs, mask), mask)
@@ -43,7 +43,7 @@ class TestGridInfer(unittest.TestCase):
 
         ck = add2d_hw_kernel.compile(a, b, c, h, w, BLOCK=block)
         self.assertEqual(
-            infer_grid(ck.ir, {"H": h, "W": w}, ck.threadgroup_size), (4, 17, 1)
+            infer_grid(ck.ir, {"H": h, "W": w}, ck.block_size), (4, 17, 1)
         )
 
     def test_infer_grid_from_shape_option_numpy(self) -> None:
@@ -56,7 +56,7 @@ class TestGridInfer(unittest.TestCase):
 
         ck = add2d_shape_kernel.compile(a, b, c, m, n, BLOCK=block)
         self.assertEqual(
-            infer_grid(ck.ir, {}, ck.threadgroup_size, shape=(m, n)),
+            infer_grid(ck.ir, {}, ck.block_size, shape=(m, n)),
             (5, 9, 1),
         )
 

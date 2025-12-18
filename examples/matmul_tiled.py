@@ -52,7 +52,7 @@ def matmul_tiled_kernel(
 
     pid_n = mk.program_id(0) + PID_N_BASE  # tile along N
     pid_m = mk.program_id(1) + PID_M_BASE  # tile along M
-    tid = mk.arange(0, NT)  # 0..NT-1
+    tid = mk.tid(0, NT)  # 0..NT-1
 
     tn = 4
     if BN % tn != 0:
@@ -157,7 +157,7 @@ def matmul_tiled_full_kernel(
 
     pid_n = mk.program_id(0)
     pid_m = mk.program_id(1)
-    tid = mk.arange(0, NT)
+    tid = mk.tid(0, NT)
 
     tn = 4
     if BN % tn != 0:

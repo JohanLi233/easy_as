@@ -26,6 +26,7 @@ Op: TypeAlias = Literal[
     "lane_id",
     "sg_id",
     "arange",
+    "tid",
     "alloc_tg",
     "add",
     "mul",
@@ -52,6 +53,7 @@ Op: TypeAlias = Literal[
 class ValueRef:
     id: int
     dtype: DType
+    lanes: int = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,6 +96,7 @@ def validate_ir(ir: IRModule) -> None:
     def define(ref: ValueRef) -> None:
         require(ref.id not in defined, f"duplicate SSA value id: {ref.id}")
         require(isinstance(ref.dtype, DType), f"invalid dtype for v{ref.id}: {ref.dtype!r}")
+        require(isinstance(ref.lanes, int) and int(ref.lanes) >= 1, f"invalid lanes for v{ref.id}: {ref.lanes!r}")
         defined[ref.id] = ref
 
     def require_value_ref(x: Any, *, what: str) -> ValueRef:
@@ -106,6 +109,21 @@ def validate_ir(ir: IRModule) -> None:
         require(
             def_ref.dtype == ref.dtype,
             f"{what} dtype mismatch for v{ref.id}: {def_ref.dtype} vs {ref.dtype}",
+        )
+        require(
+            def_ref.lanes == ref.lanes,
+            f"{what} lanes mismatch for v{ref.id}: {def_ref.lanes} vs {ref.lanes}",
+        )
+
+    def _broadcast_lanes(a: ValueRef, b: ValueRef, *, what: str) -> int:
+        if a.lanes == b.lanes:
+            return a.lanes
+        if a.lanes == 1:
+            return b.lanes
+        if b.lanes == 1:
+            return a.lanes
+        raise ValueError(
+            f"invalid IR: {what} lanes mismatch: {a.lanes} vs {b.lanes} (no broadcast)"
         )
 
     def require_numeric(dt: DType, *, what: str) -> None:
@@ -135,6 +153,7 @@ def validate_ir(ir: IRModule) -> None:
 
         if inst.op == "const":
             require(inst.out is not None, "const must produce a value")
+            require(inst.out.lanes == 1, "const output lanes must be 1")
             require(len(inst.args) == 1, f"const expects 1 arg, got {len(inst.args)}")
             v = inst.args[0]
             if inst.out.dtype == DType.BOOL:
@@ -153,6 +172,7 @@ def validate_ir(ir: IRModule) -> None:
 
         if inst.op == "alloc_tg":
             require(inst.out is not None, "alloc_tg must produce a value")
+            require(inst.out.lanes == 1, "alloc_tg output lanes must be 1")
             require(len(inst.args) == 1, f"alloc_tg expects 1 arg, got {len(inst.args)}")
             require(
                 isinstance(inst.args[0], int) and int(inst.args[0]) > 0,
@@ -165,6 +185,7 @@ def validate_ir(ir: IRModule) -> None:
 
         if inst.op in {"program_id", "thread_id", "local_id"}:
             require(inst.out is not None, f"{inst.op} must produce a value")
+            require(inst.out.lanes == 1, f"{inst.op} output lanes must be 1")
             require(inst.out.dtype == DType.U32, f"{inst.op} output must be u32")
             require(len(inst.args) == 1, f"{inst.op} expects 1 arg, got {len(inst.args)}")
             require(
@@ -183,6 +204,20 @@ def validate_ir(ir: IRModule) -> None:
                 "arange(start, size) requires Python int literals",
             )
             require(int(inst.args[1]) > 0, "arange(size) must be > 0")
+            require(inst.out.lanes == int(inst.args[1]), "arange output lanes must equal size")
+            define(inst.out)
+            continue
+
+        if inst.op == "tid":
+            require(inst.out is not None, "tid must produce a value")
+            require(inst.out.dtype == DType.U32, "tid output must be u32")
+            require(inst.out.lanes == 1, "tid output lanes must be 1")
+            require(len(inst.args) == 2, f"tid expects 2 args, got {len(inst.args)}")
+            require(
+                isinstance(inst.args[0], int) and isinstance(inst.args[1], int),
+                "tid(start, size) requires Python int literals",
+            )
+            require(int(inst.args[1]) > 0, "tid(size) must be > 0")
             define(inst.out)
             continue
 
@@ -190,6 +225,7 @@ def validate_ir(ir: IRModule) -> None:
             require(inst.out is not None, "lane_id must produce a value")
             require(len(inst.args) == 0, f"lane_id expects 0 args, got {len(inst.args)}")
             require(inst.out.dtype == DType.U32, "lane_id output must be u32")
+            require(inst.out.lanes == 1, "lane_id output lanes must be 1")
             define(inst.out)
             continue
 
@@ -197,6 +233,7 @@ def validate_ir(ir: IRModule) -> None:
             require(inst.out is not None, "sg_id must produce a value")
             require(len(inst.args) == 0, f"sg_id expects 0 args, got {len(inst.args)}")
             require(inst.out.dtype == DType.U32, "sg_id output must be u32")
+            require(inst.out.lanes == 1, "sg_id output lanes must be 1")
             define(inst.out)
             continue
 
@@ -210,6 +247,10 @@ def validate_ir(ir: IRModule) -> None:
             require(a_ref.dtype == b_ref.dtype, f"{inst.op} dtype mismatch: {a_ref.dtype} vs {b_ref.dtype}")
             require_numeric(a_ref.dtype, what=f"{inst.op} operands")
             require(inst.out.dtype == a_ref.dtype, f"{inst.op} output dtype must match operands")
+            require(
+                inst.out.lanes == _broadcast_lanes(a_ref, b_ref, what=f"{inst.op} operands"),
+                f"{inst.op} output lanes must broadcast operands",
+            )
             if inst.op in {"floordiv", "mod"}:
                 require(a_ref.dtype == DType.U32, f"{inst.op} operands must be u32")
             define(inst.out)
@@ -225,6 +266,7 @@ def validate_ir(ir: IRModule) -> None:
             require(a_ref.dtype == b_ref.dtype, f"lt dtype mismatch: {a_ref.dtype} vs {b_ref.dtype}")
             require_numeric(a_ref.dtype, what="lt operands")
             require(inst.out.dtype == DType.BOOL, "lt output must be bool")
+            require(inst.out.lanes == _broadcast_lanes(a_ref, b_ref, what="lt operands"), "lt output lanes mismatch")
             define(inst.out)
             continue
 
@@ -238,6 +280,10 @@ def validate_ir(ir: IRModule) -> None:
             require(inst.out.dtype == DType.BOOL, f"{inst.op} output must be bool")
             require(a_ref.dtype == DType.BOOL, f"{inst.op} lhs must be bool")
             require(b_ref.dtype == DType.BOOL, f"{inst.op} rhs must be bool")
+            require(
+                inst.out.lanes == _broadcast_lanes(a_ref, b_ref, what=f"{inst.op} operands"),
+                f"{inst.op} output lanes mismatch",
+            )
             define(inst.out)
             continue
 
@@ -248,6 +294,7 @@ def validate_ir(ir: IRModule) -> None:
             require_defined(x_ref, what="not input")
             require(inst.out.dtype == DType.BOOL, "not output must be bool")
             require(x_ref.dtype == DType.BOOL, "not input must be bool")
+            require(inst.out.lanes == x_ref.lanes, "not output lanes must match input")
             define(inst.out)
             continue
 
@@ -263,6 +310,9 @@ def validate_ir(ir: IRModule) -> None:
             require(c_ref.dtype == DType.BOOL, "where cond must be bool")
             require(a_ref.dtype == b_ref.dtype, f"where dtype mismatch: {a_ref.dtype} vs {b_ref.dtype}")
             require(inst.out.dtype == a_ref.dtype, "where output dtype must match values")
+            lanes_ab = _broadcast_lanes(a_ref, b_ref, what="where values")
+            lanes_out = _broadcast_lanes(c_ref, ValueRef(-1, DType.BOOL, lanes_ab), what="where cond vs values")
+            require(inst.out.lanes == lanes_out, "where output lanes mismatch")
             define(inst.out)
             continue
 
@@ -274,6 +324,7 @@ def validate_ir(ir: IRModule) -> None:
             require(isinstance(dst, DType), "cast target must be a DType")
             require_defined(x_ref, what="cast input")
             require(inst.out.dtype == dst, "cast output dtype must match target dtype")
+            require(inst.out.lanes == x_ref.lanes, "cast output lanes must match input")
             require(
                 x_ref.dtype in (DType.BOOL, DType.U32, DType.F16, DType.F32)
                 and dst in (DType.BOOL, DType.U32, DType.F16, DType.F32),
@@ -296,6 +347,14 @@ def validate_ir(ir: IRModule) -> None:
             require(off_ref.dtype == DType.U32, "load offset must be u32")
             require(mask_ref.dtype == DType.BOOL, "load mask must be bool")
             require(inst.out.dtype == buf_ref.dtype, "load output dtype must match buffer dtype")
+            require(
+                inst.out.lanes == off_ref.lanes,
+                "load output lanes must match offset lanes",
+            )
+            require(
+                mask_ref.lanes in (1, off_ref.lanes),
+                "load mask lanes must be 1 or match offset lanes",
+            )
             define(inst.out)
             continue
 
@@ -315,6 +374,14 @@ def validate_ir(ir: IRModule) -> None:
             require(off_ref.dtype == DType.U32, "store offset must be u32")
             require(mask_ref.dtype == DType.BOOL, "store mask must be bool")
             require(val_ref.dtype == buf_ref.dtype, "store value dtype must match buffer dtype")
+            require(
+                val_ref.lanes in (1, off_ref.lanes),
+                "store value lanes must be 1 or match offset lanes",
+            )
+            require(
+                mask_ref.lanes in (1, off_ref.lanes),
+                "store mask lanes must be 1 or match offset lanes",
+            )
             continue
 
         if inst.op == "fma":
@@ -329,11 +396,15 @@ def validate_ir(ir: IRModule) -> None:
             require(x_ref.dtype == y_ref.dtype == z_ref.dtype, "fma operands must have same dtype")
             require_float(x_ref.dtype, what="fma operands")
             require(inst.out.dtype == x_ref.dtype, "fma output dtype must match operands")
+            lanes_xy = _broadcast_lanes(x_ref, y_ref, what="fma x/y")
+            lanes_out = _broadcast_lanes(z_ref, ValueRef(-1, z_ref.dtype, lanes_xy), what="fma z vs x/y")
+            require(inst.out.lanes == lanes_out, "fma output lanes mismatch")
             define(inst.out)
             continue
 
         if inst.op == "dot":
             require(inst.out is not None, "dot must produce a value")
+            require(inst.out.lanes == 1, "dot output lanes must be 1")
             require(len(inst.args) == 7, f"dot expects 7 args, got {len(inst.args)}")
             a_buf, a_base, a_stride, b_buf, b_base, b_stride, k_ref = inst.args
             a_buf = require_value_ref(a_buf, what="dot a_buffer")
@@ -350,6 +421,7 @@ def validate_ir(ir: IRModule) -> None:
             require_defined(b_base, what="dot b_base")
             require_defined(b_stride, what="dot b_stride")
             require_defined(k_ref, what="dot K")
+            require(a_base.lanes == 1 and a_stride.lanes == 1 and b_base.lanes == 1 and b_stride.lanes == 1 and k_ref.lanes == 1, "dot index args must be scalar (lanes=1)")
             require(a_buf.id in buffer_value_ids, "dot a_buffer must be a buffer (arg or alloc_tg)")
             require(b_buf.id in buffer_value_ids, "dot b_buffer must be a buffer (arg or alloc_tg)")
             require(
@@ -369,6 +441,7 @@ def validate_ir(ir: IRModule) -> None:
             require(inst.out is not None, "mma_zero must produce a value")
             require(len(inst.args) == 0, f"mma_zero expects 0 args, got {len(inst.args)}")
             require(inst.out.dtype == DType.SG_F32_8X8, "mma_zero currently produces sg_f32_8x8 only")
+            require(inst.out.lanes == 1, "mma_zero output lanes must be 1")
             define(inst.out)
             continue
 
@@ -390,6 +463,15 @@ def validate_ir(ir: IRModule) -> None:
             require_defined(b_base, what="mma b_base")
             require_defined(b_stride, what="mma b_stride")
             require_defined(acc, what="mma acc")
+            require(
+                a_base.lanes == 1
+                and a_stride.lanes == 1
+                and b_base.lanes == 1
+                and b_stride.lanes == 1
+                and acc.lanes == 1
+                and inst.out.lanes == 1,
+                "mma operands/output must be scalar (lanes=1)",
+            )
             require(a_buf.id in buffer_value_ids, "mma a_buffer must be a buffer (arg or alloc_tg)")
             require(b_buf.id in buffer_value_ids, "mma b_buffer must be a buffer (arg or alloc_tg)")
             require(inst.out.dtype == DType.SG_F32_8X8, "mma currently produces sg_f32_8x8 only")
@@ -415,6 +497,7 @@ def validate_ir(ir: IRModule) -> None:
             require_defined(c_base, what="mma_store c_base")
             require_defined(c_stride, what="mma_store c_stride")
             require_defined(frag, what="mma_store frag")
+            require(c_base.lanes == 1 and c_stride.lanes == 1 and frag.lanes == 1, "mma_store operands must be scalar (lanes=1)")
             require(c_buf.id in buffer_value_ids, "mma_store c_buffer must be a buffer (arg or alloc_tg)")
             require(c_buf.dtype == DType.F32, "mma_store c_buffer must be f32")
             require(c_base.dtype == DType.U32, "mma_store c_base must be u32")

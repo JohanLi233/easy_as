@@ -15,7 +15,7 @@ from eas.runtime import get_runtime
 @eas.kernel
 def local_id_kernel(out, N, BLOCK: eas.constexpr):
     pid = mk.program_id(0)
-    _ = mk.arange(0, BLOCK)  # define threadgroup_size for MVP codegen/runtime
+    _ = mk.tid(0, BLOCK)  # define threadgroup_size for MVP codegen/runtime
     lid = mk.local_id(0)
     offs = pid * BLOCK + lid
     mk.store(out, offs, mk.to_f32(lid), offs < N)
@@ -24,7 +24,7 @@ def local_id_kernel(out, N, BLOCK: eas.constexpr):
 @eas.kernel
 def lane_id_kernel(out, N, BLOCK: eas.constexpr):
     pid = mk.program_id(0)
-    tid = pid * BLOCK + mk.arange(0, BLOCK)
+    tid = pid * BLOCK + mk.tid(0, BLOCK)
     mk.store(out, tid, mk.to_f32(mk.lane_id()), tid < N)
 
 

@@ -17,7 +17,7 @@ def tptg_independent_kernel(out, N, BLOCK: eas.constexpr):
     # Define threadgroup_size for compilation, but rely on the thread_id rewrite
     # so indexing is independent of threads_per_threadgroup.
     pid = mk.program_id(0)
-    offs = pid * BLOCK + mk.arange(0, BLOCK)
+    offs = pid * BLOCK + mk.tid(0, BLOCK)
     mk.store(out, offs, mk.to_f32(offs), offs < N)
 
 

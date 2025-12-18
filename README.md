@@ -2,6 +2,11 @@
 
 Python优先的内核 DSL（追踪）→ IR → Metal Shading Language (MSL) 代码生成，配备 Metal(MPS) 运行时。
 
+## 执行语义（重要）
+
+- `mk.arange(0, BLOCK)`：Triton 风格 SPMD（向量）语义，返回一个长度为 `BLOCK` 的“程序内向量”；编译/运行时将该 kernel 视为 **SPMD**（`tptg=(1,1,1)`，grid 按 `ceil_div(N, BLOCK)` 推导）。
+- `mk.tid(0, BLOCK)`：线程级语义（旧 `mk.arange`），返回 threadgroup 内的标量 thread id；用于 threadgroup memory、barrier、simdgroup MMA 等需要多线程协作的 kernel（编译/运行时将该 kernel 视为 **thread**，`tptg=(BLOCK,1,1)`）。
+
 ## 快速开始：元素级加法
 
 ```python

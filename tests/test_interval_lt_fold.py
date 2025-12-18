@@ -12,7 +12,7 @@ from eas import mk
 
 @eas.kernel
 def _in_tile_store_kernel(src, dst, LIMIT: eas.constexpr, NT: eas.constexpr):
-    tid = mk.arange(0, NT)
+    tid = mk.tid(0, NT)
     for i in range(0, LIMIT, NT):
         idx = tid + i
         in_tile = idx < LIMIT

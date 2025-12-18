@@ -31,7 +31,7 @@ def matmul_tiled_kernel_test(
 ):
     pid_n = mk.program_id(0)
     pid_m = mk.program_id(1)
-    tid = mk.arange(0, NT)
+    tid = mk.tid(0, NT)
 
     tn = 4
     if BN % tn != 0:

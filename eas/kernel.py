@@ -282,10 +282,13 @@ class Kernel:
             if tptg is None:
                 raise RuntimeError("internal error: normalized tptg must not be None")
             tx, ty, tz = (int(tptg[0]), int(tptg[1]), int(tptg[2]))
-            if (tx, ty, tz) != (int(ck.threadgroup_size), 1, 1):
+            expected = (
+                (int(ck.block_size), 1, 1) if ck.launch_mode == "thread" else (1, 1, 1)
+            )
+            if (tx, ty, tz) != expected:
                 raise ValueError(
-                    f"_tptg must match threadgroup_size inferred from mk.arange(0, BLOCK): "
-                    f"expected ({int(ck.threadgroup_size)}, 1, 1), got ({tx}, {ty}, {tz})"
+                    f"_tptg must match kernel launch mode: "
+                    f"expected {expected}, got ({tx}, {ty}, {tz})"
                 )
         return ck
 
@@ -306,10 +309,13 @@ class Kernel:
             if tptg is None:
                 raise RuntimeError("internal error: normalized tptg must not be None")
             tx, ty, tz = (int(tptg[0]), int(tptg[1]), int(tptg[2]))
-            if (tx, ty, tz) != (int(ck.threadgroup_size), 1, 1):
+            expected = (
+                (int(ck.block_size), 1, 1) if ck.launch_mode == "thread" else (1, 1, 1)
+            )
+            if (tx, ty, tz) != expected:
                 raise ValueError(
-                    f"_tptg must match threadgroup_size inferred from mk.arange(0, BLOCK): "
-                    f"expected ({int(ck.threadgroup_size)}, 1, 1), got ({tx}, {ty}, {tz})"
+                    f"_tptg must match kernel launch mode: "
+                    f"expected {expected}, got ({tx}, {ty}, {tz})"
                 )
         get_runtime().run(ck, runtime_args, meta, **runtime_opts)
 

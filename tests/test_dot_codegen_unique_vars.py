@@ -12,7 +12,7 @@ from eas import mk
 
 @eas.kernel
 def many_dot_kernel(out, K: eas.constexpr, BLOCK: eas.constexpr):
-    _ = mk.arange(0, BLOCK)
+    _ = mk.tid(0, BLOCK)
     As = mk.alloc_tg(1 * K)
     Bs = mk.alloc_tg(K * 1)
     mk.barrier()

@@ -14,7 +14,7 @@ import numpy as np
 
 from ..ir import DType, IRModule
 from .metal_ext import load_metal_ext
-from .grid import infer_grid, infer_nthreads
+from .grid import infer_1d_grid, infer_grid, infer_nthreads
 
 
 def _is_tensor(v: Any) -> bool:
@@ -255,34 +255,65 @@ class MetalRuntime:
     ) -> None:
         _ = meta
         ir: IRModule = ck.ir
-        threadgroup_size: int = ck.threadgroup_size
+        block_size: int = int(ck.block_size)
+        launch_mode: str = str(getattr(ck, "launch_mode", "thread"))
 
+        expected_tptg = (
+            (block_size, 1, 1) if launch_mode == "thread" else (1, 1, 1)
+        )
         if tptg is not None:
             tx, ty, tz = (int(tptg[0]), int(tptg[1]), int(tptg[2]))
-            if (tx, ty, tz) != (int(threadgroup_size), 1, 1):
+            if (tx, ty, tz) != expected_tptg:
                 raise ValueError(
-                    f"tptg must match threadgroup_size inferred from mk.arange(0, BLOCK): "
-                    f"expected ({int(threadgroup_size)}, 1, 1), got ({tx}, {ty}, {tz})"
+                    f"tptg must match kernel launch mode: expected {expected_tptg}, got ({tx}, {ty}, {tz})"
                 )
 
         tptg_eff: int | tuple[int, int, int]
-        if tptg is None:
-            tptg_eff = int(threadgroup_size)
+        if launch_mode == "thread":
+            if tptg is None:
+                tptg_eff = int(block_size)
+            else:
+                tptg_eff = tuple(int(x) for x in tptg)
         else:
-            tptg_eff = tuple(int(x) for x in tptg)
+            tptg_eff = 1
 
         if grid is None:
-            inferred = infer_grid(ir, runtime_args, threadgroup_size, shape=shape)
+            inferred = infer_grid(ir, runtime_args, block_size, shape=shape)
             if inferred is None:
                 n = infer_nthreads(runtime_args, nthreads=nthreads)
                 if n == 0:
                     return
-                tpg: int | tuple[int, int, int] = int(n)
-                tptg = tptg_eff
+                if launch_mode == "thread":
+                    tpg: int | tuple[int, int, int] = int(n)
+                    tptg = tptg_eff
+                else:
+                    gx = infer_1d_grid(runtime_args, block_size, nthreads=nthreads)
+                    if gx == 0:
+                        return
+                    tpg = int(gx)
+                    tptg = (1, 1, 1)
             else:
                 gx, gy, gz = inferred
                 if gx == 0 or gy == 0 or gz == 0:
                     return
+                if launch_mode == "thread":
+                    if isinstance(tptg_eff, int):
+                        tx, ty, tz = int(tptg_eff), 1, 1
+                        tptg = (tx, ty, tz)
+                    else:
+                        tx, ty, tz = tptg_eff
+                        tptg = (tx, ty, tz)
+                    tpg = (gx * int(tx), gy * int(ty), gz * int(tz))
+                else:
+                    tptg = (1, 1, 1)
+                    tpg = (int(gx), int(gy), int(gz))
+        else:
+            gx, gy, gz = map(int, grid)
+            if gx < 0 or gy < 0 or gz < 0:
+                raise ValueError("grid dims must be >= 0")
+            if gx == 0 or gy == 0 or gz == 0:
+                return
+            if launch_mode == "thread":
                 if isinstance(tptg_eff, int):
                     tx, ty, tz = int(tptg_eff), 1, 1
                     tptg = (tx, ty, tz)
@@ -290,19 +321,9 @@ class MetalRuntime:
                     tx, ty, tz = tptg_eff
                     tptg = (tx, ty, tz)
                 tpg = (gx * int(tx), gy * int(ty), gz * int(tz))
-        else:
-            gx, gy, gz = map(int, grid)
-            if gx < 0 or gy < 0 or gz < 0:
-                raise ValueError("grid dims must be >= 0")
-            if gx == 0 or gy == 0 or gz == 0:
-                return
-            if isinstance(tptg_eff, int):
-                tx, ty, tz = int(tptg_eff), 1, 1
-                tptg = (tx, ty, tz)
             else:
-                tx, ty, tz = tptg_eff
-                tptg = (tx, ty, tz)
-            tpg = (gx * int(tx), gy * int(ty), gz * int(tz))
+                tptg = (1, 1, 1)
+                tpg = (int(gx), int(gy), int(gz))
         writes = ck.writes
 
         argv, writable, host_copies = self._build_argv(
@@ -361,34 +382,65 @@ class MetalRuntime:
         self.synchronize()
 
         ir: IRModule = ck.ir
-        threadgroup_size: int = ck.threadgroup_size
+        block_size: int = int(ck.block_size)
+        launch_mode: str = str(getattr(ck, "launch_mode", "thread"))
 
+        expected_tptg = (
+            (block_size, 1, 1) if launch_mode == "thread" else (1, 1, 1)
+        )
         if tptg is not None:
             tx, ty, tz = (int(tptg[0]), int(tptg[1]), int(tptg[2]))
-            if (tx, ty, tz) != (int(threadgroup_size), 1, 1):
+            if (tx, ty, tz) != expected_tptg:
                 raise ValueError(
-                    f"tptg must match threadgroup_size inferred from mk.arange(0, BLOCK): "
-                    f"expected ({int(threadgroup_size)}, 1, 1), got ({tx}, {ty}, {tz})"
+                    f"tptg must match kernel launch mode: expected {expected_tptg}, got ({tx}, {ty}, {tz})"
                 )
 
         tptg_eff: int | tuple[int, int, int]
-        if tptg is None:
-            tptg_eff = int(threadgroup_size)
+        if launch_mode == "thread":
+            if tptg is None:
+                tptg_eff = int(block_size)
+            else:
+                tptg_eff = tuple(int(x) for x in tptg)
         else:
-            tptg_eff = tuple(int(x) for x in tptg)
+            tptg_eff = 1
 
         if grid is None:
-            inferred = infer_grid(ir, runtime_args, threadgroup_size, shape=shape)
+            inferred = infer_grid(ir, runtime_args, block_size, shape=shape)
             if inferred is None:
                 n = infer_nthreads(runtime_args, nthreads=nthreads)
                 if n == 0:
                     return 0.0
-                tpg: int | tuple[int, int, int] = int(n)
-                tptg = tptg_eff
+                if launch_mode == "thread":
+                    tpg: int | tuple[int, int, int] = int(n)
+                    tptg = tptg_eff
+                else:
+                    gx = infer_1d_grid(runtime_args, block_size, nthreads=nthreads)
+                    if gx == 0:
+                        return 0.0
+                    tpg = int(gx)
+                    tptg = (1, 1, 1)
             else:
                 gx, gy, gz = inferred
                 if gx == 0 or gy == 0 or gz == 0:
                     return 0.0
+                if launch_mode == "thread":
+                    if isinstance(tptg_eff, int):
+                        tx, ty, tz = int(tptg_eff), 1, 1
+                        tptg = (tx, ty, tz)
+                    else:
+                        tx, ty, tz = tptg_eff
+                        tptg = (tx, ty, tz)
+                    tpg = (gx * int(tx), gy * int(ty), gz * int(tz))
+                else:
+                    tptg = (1, 1, 1)
+                    tpg = (int(gx), int(gy), int(gz))
+        else:
+            gx, gy, gz = map(int, grid)
+            if gx < 0 or gy < 0 or gz < 0:
+                raise ValueError("grid dims must be >= 0")
+            if gx == 0 or gy == 0 or gz == 0:
+                return 0.0
+            if launch_mode == "thread":
                 if isinstance(tptg_eff, int):
                     tx, ty, tz = int(tptg_eff), 1, 1
                     tptg = (tx, ty, tz)
@@ -396,19 +448,9 @@ class MetalRuntime:
                     tx, ty, tz = tptg_eff
                     tptg = (tx, ty, tz)
                 tpg = (gx * int(tx), gy * int(ty), gz * int(tz))
-        else:
-            gx, gy, gz = map(int, grid)
-            if gx < 0 or gy < 0 or gz < 0:
-                raise ValueError("grid dims must be >= 0")
-            if gx == 0 or gy == 0 or gz == 0:
-                return 0.0
-            if isinstance(tptg_eff, int):
-                tx, ty, tz = int(tptg_eff), 1, 1
-                tptg = (tx, ty, tz)
             else:
-                tx, ty, tz = tptg_eff
-                tptg = (tx, ty, tz)
-            tpg = (gx * int(tx), gy * int(ty), gz * int(tz))
+                tptg = (1, 1, 1)
+                tpg = (int(gx), int(gy), int(gz))
 
         argv, writable, host_copies = self._build_argv(
             ir, runtime_args, ck.writes, torch_mps_sync=torch_mps_sync

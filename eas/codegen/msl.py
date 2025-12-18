@@ -56,7 +56,301 @@ def _ref(ctx: _Ctx, v: ValueRef) -> str:
     return ctx.arg_names.get(v.id, f"v{v.id}")
 
 
-def ir_to_msl(ir: IRModule) -> tuple[str, int]:
+def _infer_block_and_mode(ir: IRModule) -> tuple[int, str]:
+    """
+    Infer BLOCK sizing and execution mode.
+
+    - spmd: mk.arange(0, BLOCK) => vector lanes = BLOCK
+    - thread: mk.tid(0, BLOCK)  => scalar local thread id, tptg.x = BLOCK
+    """
+
+    arange_size: int | None = None
+    tid_size: int | None = None
+    for inst in ir.insts:
+        if inst.op == "arange":
+            size = int(inst.args[1])
+            if arange_size is None:
+                arange_size = size
+            elif arange_size != size:
+                raise ValueError("multiple arange sizes not supported in MVP")
+        elif inst.op == "tid":
+            size = int(inst.args[1])
+            if tid_size is None:
+                tid_size = size
+            elif tid_size != size:
+                raise ValueError("multiple tid sizes not supported in MVP")
+
+    if arange_size is not None and tid_size is not None:
+        raise ValueError("kernel must not mix mk.arange(...) and mk.tid(...) in MVP")
+    if arange_size is not None:
+        if arange_size <= 0:
+            raise ValueError("arange(size) must be > 0")
+        return (arange_size, "spmd")
+    if tid_size is not None:
+        if tid_size <= 0:
+            raise ValueError("tid(size) must be > 0")
+        return (tid_size, "thread")
+    raise ValueError(
+        "kernel must use mk.arange(0, BLOCK) (spmd) or mk.tid(0, BLOCK) (thread) to define BLOCK"
+    )
+
+
+def _ir_to_msl_spmd(ir: IRModule, ctx: _Ctx, *, block_size: int) -> str:
+    forbidden_ops = {
+        "tid",
+        "local_id",
+        "lane_id",
+        "sg_id",
+        "dot",
+        "mma_zero",
+        "mma",
+        "mma_store",
+    }
+    for inst in ir.insts:
+        if str(inst.op) in forbidden_ops:
+            raise ValueError(f"op {inst.op!r} is not supported in spmd mode (use mk.tid for thread-level kernels)")
+
+    def _lane(ref: ValueRef, i: str) -> str:
+        name = _ref(ctx, ref)
+        return name if ref.lanes == 1 else f"{name}[{i}]"
+
+    def _declare(out: ValueRef) -> str:
+        ty = _msl_type(out.dtype)
+        if out.lanes == 1:
+            return f"{ty} v{out.id}"
+        return f"{ty} v{out.id}[{out.lanes}]"
+
+    def _emit_assign_binop(op: str, out: ValueRef, a: ValueRef, b: ValueRef, *, indent: str) -> list[str]:
+        ty = _msl_type(out.dtype)
+        lines: list[str] = []
+        if out.lanes == 1:
+            lines.append(f"{indent}{ty} v{out.id} = {_lane(a, '0')} {op} {_lane(b, '0')};")
+            return lines
+        lines.append(f"{indent}{ty} v{out.id}[{out.lanes}];")
+        lines.append(f"{indent}#pragma clang loop unroll_count({out.lanes})")
+        lines.append(f"{indent}for (uint i = 0; i < {out.lanes}u; ++i) {{")
+        lines.append(f"{indent}  v{out.id}[i] = {_lane(a, 'i')} {op} {_lane(b, 'i')};")
+        lines.append(f"{indent}}}")
+        return lines
+
+    def _emit_assign_unary(op: str, out: ValueRef, x: ValueRef, *, indent: str) -> list[str]:
+        ty = _msl_type(out.dtype)
+        lines: list[str] = []
+        if out.lanes == 1:
+            lines.append(f"{indent}{ty} v{out.id} = {op}{_lane(x, '0')};")
+            return lines
+        lines.append(f"{indent}{ty} v{out.id}[{out.lanes}];")
+        lines.append(f"{indent}#pragma clang loop unroll_count({out.lanes})")
+        lines.append(f"{indent}for (uint i = 0; i < {out.lanes}u; ++i) {{")
+        lines.append(f"{indent}  v{out.id}[i] = {op}{_lane(x, 'i')};")
+        lines.append(f"{indent}}}")
+        return lines
+
+    # kernel signature
+    needs_tpig = any(inst.op in {"program_id", "thread_id"} for inst in ir.insts)
+
+    lines: list[str] = []
+    lines.append("#include <metal_stdlib>")
+    lines.append("using namespace metal;")
+    lines.append("")
+    lines.append(f"kernel void {ir.name}(")
+
+    params: list[str] = []
+    buf_index = 0
+    for arg in ir.args:
+        if arg.kind == "buffer":
+            const_kw = "" if arg.name in ctx.uses_store else "const "
+            params.append(
+                f"device {const_kw}{_msl_type(arg.dtype)}* __restrict {arg.name} [[buffer({buf_index})]]"
+            )
+        else:
+            params.append(
+                f"constant {_msl_type(arg.dtype)}& {arg.name} [[buffer({buf_index})]]"
+            )
+        buf_index += 1
+    if needs_tpig:
+        params.append("uint3 tpig [[thread_position_in_grid]]")
+
+    lines.append(",\n".join(f"    {p}" for p in params))
+    lines.append(") {")
+
+    # threadgroup allocations
+    for inst in ir.insts:
+        if inst.op != "alloc_tg":
+            continue
+        assert inst.out is not None
+        (size,) = inst.args
+        lines.append(
+            f"  threadgroup {_msl_type(inst.out.dtype)} v{inst.out.id}[{int(size)}];"
+        )
+
+    # body
+    for inst in ir.insts:
+        if inst.op in {"arg", "alloc_tg"}:
+            continue
+        if inst.op == "const":
+            assert inst.out is not None
+            out = inst.out
+            lines.append(f"  {_msl_type(out.dtype)} v{out.id} = {_const_literal(inst.args[0])};")
+            continue
+        if inst.op == "program_id":
+            assert inst.out is not None
+            out = inst.out
+            axis = int(inst.args[0])
+            comp = {0: "x", 1: "y", 2: "z"}.get(axis)
+            if comp is None:
+                raise ValueError(f"program_id axis must be 0/1/2, got {axis}")
+            lines.append(f"  uint v{out.id} = tpig.{comp};")
+            continue
+        if inst.op == "thread_id":
+            assert inst.out is not None
+            out = inst.out
+            axis = int(inst.args[0])
+            comp = {0: "x", 1: "y", 2: "z"}.get(axis)
+            if comp is None:
+                raise ValueError(f"thread_id axis must be 0/1/2, got {axis}")
+            lines.append(f"  uint v{out.id} = tpig.{comp};")
+            continue
+        if inst.op == "arange":
+            assert inst.out is not None
+            out = inst.out
+            start, size = (int(inst.args[0]), int(inst.args[1]))
+            if size != out.lanes:
+                raise ValueError("internal error: arange lanes mismatch")
+            lines.append(f"  uint v{out.id}[{size}];")
+            lines.append(f"  #pragma clang loop unroll_count({size})")
+            lines.append(f"  for (uint i = 0; i < {size}u; ++i) {{ v{out.id}[i] = (uint)({start}) + i; }}")
+            continue
+        if inst.op in {"add", "mul", "floordiv", "mod", "lt"}:
+            assert inst.out is not None
+            out = inst.out
+            a, b = inst.args  # type: ignore[misc]
+            assert isinstance(a, ValueRef) and isinstance(b, ValueRef)
+            op = {
+                "add": "+",
+                "mul": "*",
+                "floordiv": "/",
+                "mod": "%",
+                "lt": "<",
+            }[inst.op]
+            lines.extend(_emit_assign_binop(op, out, a, b, indent="  "))
+            continue
+        if inst.op in {"and", "or"}:
+            assert inst.out is not None
+            out = inst.out
+            a, b = inst.args  # type: ignore[misc]
+            assert isinstance(a, ValueRef) and isinstance(b, ValueRef)
+            op = "&&" if inst.op == "and" else "||"
+            lines.extend(_emit_assign_binop(op, out, a, b, indent="  "))
+            continue
+        if inst.op == "not":
+            assert inst.out is not None
+            out = inst.out
+            (x,) = inst.args  # type: ignore[misc]
+            assert isinstance(x, ValueRef)
+            lines.extend(_emit_assign_unary("!", out, x, indent="  "))
+            continue
+        if inst.op == "where":
+            assert inst.out is not None
+            out = inst.out
+            c, a, b = inst.args  # type: ignore[misc]
+            assert isinstance(c, ValueRef) and isinstance(a, ValueRef) and isinstance(b, ValueRef)
+            ty = _msl_type(out.dtype)
+            if out.lanes == 1:
+                lines.append(f"  {ty} v{out.id} = {_lane(c, '0')} ? {_lane(a, '0')} : {_lane(b, '0')};")
+            else:
+                lines.append(f"  {ty} v{out.id}[{out.lanes}];")
+                lines.append(f"  #pragma clang loop unroll_count({out.lanes})")
+                lines.append(f"  for (uint i = 0; i < {out.lanes}u; ++i) {{")
+                lines.append(f"    v{out.id}[i] = {_lane(c, 'i')} ? {_lane(a, 'i')} : {_lane(b, 'i')};")
+                lines.append("  }")
+            continue
+        if inst.op == "cast":
+            assert inst.out is not None
+            out = inst.out
+            x_ref, dst = inst.args  # type: ignore[misc]
+            assert isinstance(x_ref, ValueRef) and isinstance(dst, DType)
+            ty = _msl_type(out.dtype)
+            dst_ty = _msl_type(dst)
+            if out.lanes == 1:
+                lines.append(f"  {ty} v{out.id} = ({dst_ty})({_lane(x_ref, '0')});")
+            else:
+                lines.append(f"  {ty} v{out.id}[{out.lanes}];")
+                lines.append(f"  #pragma clang loop unroll_count({out.lanes})")
+                lines.append(f"  for (uint i = 0; i < {out.lanes}u; ++i) {{")
+                lines.append(f"    v{out.id}[i] = ({dst_ty})({_lane(x_ref, 'i')});")
+                lines.append("  }")
+            continue
+        if inst.op == "fma":
+            assert inst.out is not None
+            out = inst.out
+            x, y, z = inst.args  # type: ignore[misc]
+            assert isinstance(x, ValueRef) and isinstance(y, ValueRef) and isinstance(z, ValueRef)
+            ty = _msl_type(out.dtype)
+            if out.lanes == 1:
+                if out.dtype == DType.F16:
+                    lines.append(
+                        f"  half v{out.id} = half(fma((float){_lane(x, '0')}, (float){_lane(y, '0')}, (float){_lane(z, '0')}));"
+                    )
+                else:
+                    lines.append(f"  {ty} v{out.id} = fma({_lane(x, '0')}, {_lane(y, '0')}, {_lane(z, '0')});")
+            else:
+                lines.append(f"  {ty} v{out.id}[{out.lanes}];")
+                lines.append(f"  #pragma clang loop unroll_count({out.lanes})")
+                lines.append(f"  for (uint i = 0; i < {out.lanes}u; ++i) {{")
+                if out.dtype == DType.F16:
+                    lines.append(
+                        f"    v{out.id}[i] = half(fma((float){_lane(x, 'i')}, (float){_lane(y, 'i')}, (float){_lane(z, 'i')}));"
+                    )
+                else:
+                    lines.append(f"    v{out.id}[i] = fma({_lane(x, 'i')}, {_lane(y, 'i')}, {_lane(z, 'i')});")
+                lines.append("  }")
+            continue
+        if inst.op == "load":
+            assert inst.out is not None
+            out = inst.out
+            buf_ref, off_ref, mask_ref = inst.args  # type: ignore[misc]
+            assert isinstance(buf_ref, ValueRef) and isinstance(off_ref, ValueRef) and isinstance(mask_ref, ValueRef)
+            buf_name = _ref(ctx, buf_ref)
+            out_ty = _msl_type(out.dtype)
+            zero = _zero_literal(out.dtype)
+            if out.lanes == 1:
+                lines.append(f"  {out_ty} v{out.id} = {zero};")
+                lines.append(f"  if ({_lane(mask_ref, '0')}) {{ v{out.id} = {buf_name}[{_lane(off_ref, '0')}]; }}")
+            else:
+                lines.append(f"  {out_ty} v{out.id}[{out.lanes}];")
+                lines.append(f"  #pragma clang loop unroll_count({out.lanes})")
+                lines.append(f"  for (uint i = 0; i < {out.lanes}u; ++i) {{")
+                lines.append(f"    {out_ty} tmp = {zero};")
+                lines.append(f"    if ({_lane(mask_ref, 'i')}) tmp = {buf_name}[{_lane(off_ref, 'i')}];")
+                lines.append(f"    v{out.id}[i] = tmp;")
+                lines.append("  }")
+            continue
+        if inst.op == "store":
+            buf_ref, off_ref, val_ref, mask_ref = inst.args  # type: ignore[misc]
+            assert isinstance(buf_ref, ValueRef) and isinstance(off_ref, ValueRef) and isinstance(val_ref, ValueRef) and isinstance(mask_ref, ValueRef)
+            buf_name = _ref(ctx, buf_ref)
+            if off_ref.lanes == 1:
+                lines.append(f"  if ({_lane(mask_ref, '0')}) {{ {buf_name}[{_lane(off_ref, '0')}] = {_lane(val_ref, '0')}; }}")
+            else:
+                lines.append(f"  #pragma clang loop unroll_count({off_ref.lanes})")
+                lines.append(f"  for (uint i = 0; i < {off_ref.lanes}u; ++i) {{")
+                lines.append(
+                    f"    if ({_lane(mask_ref, 'i')}) {{ {buf_name}[{_lane(off_ref, 'i')}] = {_lane(val_ref, 'i')}; }}"
+                )
+                lines.append("  }")
+            continue
+        if inst.op == "barrier":
+            lines.append("  threadgroup_barrier(mem_flags::mem_threadgroup);")
+            continue
+
+        raise ValueError(f"unsupported op in spmd codegen: {inst.op!r}")
+
+    lines.append("}")
+    return "\n".join(lines) + "\n"
+
+
+def ir_to_msl(ir: IRModule) -> tuple[str, int, str]:
     arg_names: dict[int, str] = {}
     uses_store: set[str] = set()
     def_by_id: dict[int, Any] = {}
@@ -121,7 +415,10 @@ def ir_to_msl(ir: IRModule) -> tuple[str, int]:
 
     ctx = _Ctx(arg_names=arg_names, uses_store=uses_store)
 
-    threadgroup_size = _infer_threadgroup_size(ir)
+    block_size, mode = _infer_block_and_mode(ir)
+    if mode == "spmd":
+        return (_ir_to_msl_spmd(ir, ctx, block_size=block_size), block_size, "spmd")
+    threadgroup_size = block_size
 
     use_counts: dict[int, int] = {}
     for inst in ir.insts:
@@ -332,7 +629,7 @@ def ir_to_msl(ir: IRModule) -> tuple[str, int]:
                     ok = False
                     break
                 def_inst = ir.insts[idx]
-                if def_inst.op in {"arg", "program_id", "thread_id", "arange"}:
+                if def_inst.op in {"arg", "program_id", "thread_id", "tid"}:
                     continue
                 if def_inst.op == "load":
                     _buf, _off, load_mask = def_inst.args  # type: ignore[misc]
@@ -406,7 +703,7 @@ def ir_to_msl(ir: IRModule) -> tuple[str, int]:
             continue
         if inst.op == "program_id":
             needs_tgpig = True
-        elif inst.op == "arange":
+        elif inst.op == "tid":
             needs_tpitg = True
         elif inst.op == "thread_id":
             needs_tpig = True
@@ -521,6 +818,8 @@ def ir_to_msl(ir: IRModule) -> tuple[str, int]:
             lines.append(f"{indent}uint v{out.id} = sg;")
             return
         if inst.op == "arange":
+            raise ValueError("arange is not supported in thread mode codegen; use mk.tid(...) for thread-level kernels")
+        if inst.op == "tid":
             out = inst.out
             assert out is not None
             start, size = (int(inst.args[0]), int(inst.args[1]))
@@ -1131,20 +1430,4 @@ def ir_to_msl(ir: IRModule) -> tuple[str, int]:
         idx += 1
 
     lines.append("}")
-    return ("\n".join(lines) + "\n", threadgroup_size)
-
-
-def _infer_threadgroup_size(ir: IRModule) -> int:
-    size: int | None = None
-    for inst in ir.insts:
-        if inst.op == "arange":
-            inst_size = int(inst.args[1])
-            if size is None:
-                size = inst_size
-            elif size != inst_size:
-                raise ValueError("multiple arange sizes not supported in MVP")
-    if size is None:
-        raise ValueError(
-            "kernel must use mk.arange(0, BLOCK) to define threadgroup size"
-        )
-    return size
+    return ("\n".join(lines) + "\n", threadgroup_size, "thread")

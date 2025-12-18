@@ -137,8 +137,8 @@ class _IRBuilder:
     _buffer_ids: set[int]
     _next_id: int = 0
 
-    def _new(self, dtype: DType) -> mk.val:
-        v = mk.val(ValueRef(self._next_id, dtype))
+    def _new(self, dtype: DType, *, lanes: int = 1) -> mk.val:
+        v = mk.val(ValueRef(self._next_id, dtype, int(lanes)))
         self._next_id += 1
         return v
 
@@ -190,8 +190,19 @@ class _IRBuilder:
             )
         if size <= 0:
             raise ValueError("arange(size) must be > 0")
-        v = self._new(DType.U32)
+        v = self._new(DType.U32, lanes=int(size))
         self.insts.append(Inst("arange", v.ref, (int(start), int(size))))
+        return v
+
+    def tid(self, start: int, size: int) -> mk.val:
+        if not isinstance(start, int) or not isinstance(size, int):
+            raise TypeError(
+                "tid(start, size) requires Python ints (compile-time constants)"
+            )
+        if size <= 0:
+            raise ValueError("tid(size) must be > 0")
+        v = self._new(DType.U32)
+        self.insts.append(Inst("tid", v.ref, (int(start), int(size))))
         return v
 
     def alloc_tg(self, size: int, *, dtype: DType = DType.F32) -> mk.val:
@@ -216,7 +227,10 @@ class _IRBuilder:
         bv = self._coerce(b)
         if av.dtype != bv.dtype:
             raise TypeError(f"add dtype mismatch: {av.dtype} vs {bv.dtype}")
-        out = self._new(av.dtype)
+        if av.ref.lanes != bv.ref.lanes and av.ref.lanes != 1 and bv.ref.lanes != 1:
+            raise TypeError(f"add lanes mismatch: {av.ref.lanes} vs {bv.ref.lanes}")
+        out_lanes = bv.ref.lanes if av.ref.lanes == 1 else av.ref.lanes
+        out = self._new(av.dtype, lanes=out_lanes)
         self.insts.append(Inst("add", out.ref, (av.ref, bv.ref)))
         return out
 
@@ -225,7 +239,10 @@ class _IRBuilder:
         bv = self._coerce(b)
         if av.dtype != bv.dtype:
             raise TypeError(f"mul dtype mismatch: {av.dtype} vs {bv.dtype}")
-        out = self._new(av.dtype)
+        if av.ref.lanes != bv.ref.lanes and av.ref.lanes != 1 and bv.ref.lanes != 1:
+            raise TypeError(f"mul lanes mismatch: {av.ref.lanes} vs {bv.ref.lanes}")
+        out_lanes = bv.ref.lanes if av.ref.lanes == 1 else av.ref.lanes
+        out = self._new(av.dtype, lanes=out_lanes)
         self.insts.append(Inst("mul", out.ref, (av.ref, bv.ref)))
         return out
 
@@ -237,7 +254,13 @@ class _IRBuilder:
             raise TypeError(
                 f"fma dtype mismatch: {av.dtype} vs {bv.dtype} vs {cv.dtype}"
             )
-        out = self._new(av.dtype)
+        lanes = av.ref.lanes
+        for v in (bv, cv):
+            if lanes == 1:
+                lanes = v.ref.lanes
+            elif v.ref.lanes not in (1, lanes):
+                raise TypeError(f"fma lanes mismatch: {lanes} vs {v.ref.lanes}")
+        out = self._new(av.dtype, lanes=lanes)
         self.insts.append(Inst("fma", out.ref, (av.ref, bv.ref, cv.ref)))
         return out
 
@@ -248,7 +271,10 @@ class _IRBuilder:
             raise TypeError(f"floordiv dtype mismatch: {av.dtype} vs {bv.dtype}")
         if av.dtype != DType.U32:
             raise TypeError(f"floordiv expects u32, got {av.dtype}")
-        out = self._new(DType.U32)
+        if av.ref.lanes != bv.ref.lanes and av.ref.lanes != 1 and bv.ref.lanes != 1:
+            raise TypeError(f"floordiv lanes mismatch: {av.ref.lanes} vs {bv.ref.lanes}")
+        out_lanes = bv.ref.lanes if av.ref.lanes == 1 else av.ref.lanes
+        out = self._new(DType.U32, lanes=out_lanes)
         self.insts.append(Inst("floordiv", out.ref, (av.ref, bv.ref)))
         return out
 
@@ -259,7 +285,10 @@ class _IRBuilder:
             raise TypeError(f"mod dtype mismatch: {av.dtype} vs {bv.dtype}")
         if av.dtype != DType.U32:
             raise TypeError(f"mod expects u32, got {av.dtype}")
-        out = self._new(DType.U32)
+        if av.ref.lanes != bv.ref.lanes and av.ref.lanes != 1 and bv.ref.lanes != 1:
+            raise TypeError(f"mod lanes mismatch: {av.ref.lanes} vs {bv.ref.lanes}")
+        out_lanes = bv.ref.lanes if av.ref.lanes == 1 else av.ref.lanes
+        out = self._new(DType.U32, lanes=out_lanes)
         self.insts.append(Inst("mod", out.ref, (av.ref, bv.ref)))
         return out
 
@@ -268,7 +297,10 @@ class _IRBuilder:
         bv = self._coerce(b)
         if av.dtype != bv.dtype:
             raise TypeError(f"lt dtype mismatch: {av.dtype} vs {bv.dtype}")
-        out = self._new(DType.BOOL)
+        if av.ref.lanes != bv.ref.lanes and av.ref.lanes != 1 and bv.ref.lanes != 1:
+            raise TypeError(f"lt lanes mismatch: {av.ref.lanes} vs {bv.ref.lanes}")
+        out_lanes = bv.ref.lanes if av.ref.lanes == 1 else av.ref.lanes
+        out = self._new(DType.BOOL, lanes=out_lanes)
         self.insts.append(Inst("lt", out.ref, (av.ref, bv.ref)))
         return out
 
@@ -277,7 +309,10 @@ class _IRBuilder:
         bv = self._coerce(b)
         if av.dtype != DType.BOOL or bv.dtype != DType.BOOL:
             raise TypeError("and/or/not expect bool operands")
-        out = self._new(DType.BOOL)
+        if av.ref.lanes != bv.ref.lanes and av.ref.lanes != 1 and bv.ref.lanes != 1:
+            raise TypeError(f"and lanes mismatch: {av.ref.lanes} vs {bv.ref.lanes}")
+        out_lanes = bv.ref.lanes if av.ref.lanes == 1 else av.ref.lanes
+        out = self._new(DType.BOOL, lanes=out_lanes)
         self.insts.append(Inst("and", out.ref, (av.ref, bv.ref)))
         return out
 
@@ -286,7 +321,10 @@ class _IRBuilder:
         bv = self._coerce(b)
         if av.dtype != DType.BOOL or bv.dtype != DType.BOOL:
             raise TypeError("and/or/not expect bool operands")
-        out = self._new(DType.BOOL)
+        if av.ref.lanes != bv.ref.lanes and av.ref.lanes != 1 and bv.ref.lanes != 1:
+            raise TypeError(f"or lanes mismatch: {av.ref.lanes} vs {bv.ref.lanes}")
+        out_lanes = bv.ref.lanes if av.ref.lanes == 1 else av.ref.lanes
+        out = self._new(DType.BOOL, lanes=out_lanes)
         self.insts.append(Inst("or", out.ref, (av.ref, bv.ref)))
         return out
 
@@ -294,7 +332,7 @@ class _IRBuilder:
         xv = self._coerce(x)
         if xv.dtype != DType.BOOL:
             raise TypeError("and/or/not expect bool operands")
-        out = self._new(DType.BOOL)
+        out = self._new(DType.BOOL, lanes=xv.ref.lanes)
         self.insts.append(Inst("not", out.ref, (xv.ref,)))
         return out
 
@@ -306,7 +344,15 @@ class _IRBuilder:
             raise TypeError(f"where(cond, ...) expects bool condition, got {cv.dtype}")
         if av.dtype != bv.dtype:
             raise TypeError(f"where value dtype mismatch: {av.dtype} vs {bv.dtype}")
-        out = self._new(av.dtype)
+        lanes = av.ref.lanes
+        if lanes == 1:
+            lanes = bv.ref.lanes
+        if lanes == 1:
+            lanes = cv.ref.lanes
+        for v in (bv, cv):
+            if v.ref.lanes not in (1, lanes):
+                raise TypeError(f"where lanes mismatch: {lanes} vs {v.ref.lanes}")
+        out = self._new(av.dtype, lanes=lanes)
         self.insts.append(Inst("where", out.ref, (cv.ref, av.ref, bv.ref)))
         return out
 
@@ -316,7 +362,7 @@ class _IRBuilder:
             raise TypeError("cast(x, dtype) expects dtype to be a DType")
         if xv.dtype == dtype:
             return xv
-        out = self._new(dtype)
+        out = self._new(dtype, lanes=xv.ref.lanes)
         self.insts.append(Inst("cast", out.ref, (xv.ref, dtype)))
         return out
 
@@ -353,6 +399,8 @@ class _IRBuilder:
         }.items():
             if v.dtype != DType.U32:
                 raise TypeError(f"dot {name} must be u32, got {v.dtype}")
+            if v.ref.lanes != 1:
+                raise TypeError(f"dot {name} must be scalar (lanes=1), got lanes={v.ref.lanes}")
 
         out = self._new(DType.F32)
         self.insts.append(
@@ -410,8 +458,12 @@ class _IRBuilder:
         }.items():
             if v.dtype != DType.U32:
                 raise TypeError(f"mma {name} must be u32, got {v.dtype}")
+            if v.ref.lanes != 1:
+                raise TypeError(f"mma {name} must be scalar (lanes=1), got lanes={v.ref.lanes}")
         if acc_v.dtype != DType.SG_F32_8X8:
             raise TypeError(f"mma acc must be sg_f32_8x8, got {acc_v.dtype}")
+        if acc_v.ref.lanes != 1:
+            raise TypeError(f"mma acc must be scalar (lanes=1), got lanes={acc_v.ref.lanes}")
 
         out = self._new(DType.SG_F32_8X8)
         self.insts.append(
@@ -446,6 +498,8 @@ class _IRBuilder:
             raise TypeError(f"mma_store stride must be u32, got {stride_v.dtype}")
         if frag_v.dtype != DType.SG_F32_8X8:
             raise TypeError(f"mma_store frag must be sg_f32_8x8, got {frag_v.dtype}")
+        if base_v.ref.lanes != 1 or stride_v.ref.lanes != 1 or frag_v.ref.lanes != 1:
+            raise TypeError("mma_store base/stride/frag must be scalar (lanes=1)")
         self.insts.append(
             Inst("mma_store", None, (buffer.ref, base_v.ref, stride_v.ref, frag_v.ref))
         )
@@ -461,7 +515,11 @@ class _IRBuilder:
             raise TypeError(f"load offset must be u32, got {offv.dtype}")
         if maskv.dtype != DType.BOOL:
             raise TypeError(f"load mask must be bool, got {maskv.dtype}")
-        out = self._new(buffer.dtype)
+        if maskv.ref.lanes not in (1, offv.ref.lanes):
+            raise TypeError(
+                f"load mask lanes must be 1 or match offset lanes, got {maskv.ref.lanes} vs {offv.ref.lanes}"
+            )
+        out = self._new(buffer.dtype, lanes=offv.ref.lanes)
         self.insts.append(Inst("load", out.ref, (buffer.ref, offv.ref, maskv.ref)))
         return out
 
@@ -479,6 +537,14 @@ class _IRBuilder:
             raise TypeError(f"store mask must be bool, got {maskv.dtype}")
         if valv.dtype != buffer.dtype:
             raise TypeError(f"store dtype mismatch: {buffer.dtype} vs {valv.dtype}")
+        if valv.ref.lanes not in (1, offv.ref.lanes):
+            raise TypeError(
+                f"store value lanes must be 1 or match offset lanes, got {valv.ref.lanes} vs {offv.ref.lanes}"
+            )
+        if maskv.ref.lanes not in (1, offv.ref.lanes):
+            raise TypeError(
+                f"store mask lanes must be 1 or match offset lanes, got {maskv.ref.lanes} vs {offv.ref.lanes}"
+            )
         self.insts.append(
             Inst("store", None, (buffer.ref, offv.ref, valv.ref, maskv.ref))
         )
@@ -555,7 +621,8 @@ def _with_globals(
 class CompiledKernel:
     ir: IRModule
     msl: str
-    threadgroup_size: int
+    block_size: int
+    launch_mode: str
     writes: frozenset[str]
 
 
@@ -567,10 +634,14 @@ def compile(
     validate_ir(ir)
     from .codegen.msl import ir_to_msl
 
-    msl_src, threadgroup_size = ir_to_msl(ir)
+    msl_src, block_size, launch_mode = ir_to_msl(ir)
     writes = infer_writes(ir)
     return CompiledKernel(
-        ir=ir, msl=msl_src, threadgroup_size=threadgroup_size, writes=writes
+        ir=ir,
+        msl=msl_src,
+        block_size=int(block_size),
+        launch_mode=str(launch_mode),
+        writes=writes,
     )
 
 
@@ -588,7 +659,7 @@ def _fold_static_lts(ir: IRModule) -> IRModule:
     """
     Tiny interval pass to fold lt() to constants for common patterns like:
 
-      tid = arange(0, NT)              => tid in [0, NT-1]
+      tid = tid(0, NT)                => tid in [0, NT-1]
       a_idx = tid + CONST_I            => a_idx in [I, I+NT-1]
       in_tile = a_idx < CONST_LIMIT    => can be always-true/false
 
@@ -603,7 +674,7 @@ def _fold_static_lts(ir: IRModule) -> IRModule:
 
     inferred_threadgroup_size: int | None = None
     for inst in ir.insts:
-        if inst.op == "arange":
+        if inst.op == "tid":
             size = int(inst.args[1])
             if inferred_threadgroup_size is None:
                 inferred_threadgroup_size = size
@@ -641,7 +712,7 @@ def _fold_static_lts(ir: IRModule) -> IRModule:
                 interval_by_id[out.id] = (int(v), int(v))
             continue
 
-        if inst.op == "arange":
+        if inst.op in {"arange", "tid"}:
             start, size = (int(inst.args[0]), int(inst.args[1]))
             interval_by_id[out.id] = (start, start + size - 1)
             continue
@@ -870,12 +941,12 @@ def _rewrite_thread_id(ir: IRModule) -> IRModule:
 
     inferred_threadgroup_size: int | None = None
     for inst in ir.insts:
-        if inst.op == "arange":
+        if inst.op == "tid":
             size = int(inst.args[1])
             if inferred_threadgroup_size is None:
                 inferred_threadgroup_size = size
             elif inferred_threadgroup_size != size:
-                # Multiple arange sizes: cannot safely rewrite to a single thread_id.
+                # Multiple tid sizes: cannot safely rewrite to a single thread_id.
                 return ir
     if inferred_threadgroup_size is None:
         return ir
@@ -896,17 +967,17 @@ def _rewrite_thread_id(ir: IRModule) -> IRModule:
             new_insts.append(inst)
             continue
 
-        def _match(mul_ref: ValueRef, arange_ref: ValueRef) -> bool:
+        def _match(mul_ref: ValueRef, tid_ref: ValueRef) -> bool:
             mul_inst = def_by_id.get(mul_ref.id)
-            arange_inst = def_by_id.get(arange_ref.id)
-            if mul_inst is None or arange_inst is None:
+            tid_inst = def_by_id.get(tid_ref.id)
+            if mul_inst is None or tid_inst is None:
                 return False
             if mul_inst.op != "mul" or mul_inst.out is None:
                 return False
-            if arange_inst.op != "arange" or arange_inst.out is None:
+            if tid_inst.op != "tid" or tid_inst.out is None:
                 return False
 
-            start, size = (int(arange_inst.args[0]), int(arange_inst.args[1]))
+            start, size = (int(tid_inst.args[0]), int(tid_inst.args[1]))
             if start != 0:
                 return False
             if size != inferred_threadgroup_size:
@@ -1037,47 +1108,47 @@ def _cse_pure(ir: IRModule) -> IRModule:
 
     def _key_for(inst: Inst, out: ValueRef) -> tuple[object, ...] | None:
         if inst.op == "const":
-            return ("const", out.dtype, inst.args[0])
+            return ("const", out.dtype, out.lanes, inst.args[0])
         if inst.op in {"program_id", "thread_id", "local_id"}:
-            return (inst.op, out.dtype, int(inst.args[0]))
+            return (inst.op, out.dtype, out.lanes, int(inst.args[0]))
         if inst.op in {"lane_id", "sg_id"}:
-            return (inst.op, out.dtype)
-        if inst.op == "arange":
-            return ("arange", out.dtype, int(inst.args[0]), int(inst.args[1]))
+            return (inst.op, out.dtype, out.lanes)
+        if inst.op in {"arange", "tid"}:
+            return (inst.op, out.dtype, out.lanes, int(inst.args[0]), int(inst.args[1]))
         if inst.op in {"add", "mul"}:
             a_ref, b_ref = (_remap_arg(inst.args[0]), _remap_arg(inst.args[1]))
             assert isinstance(a_ref, ValueRef) and isinstance(b_ref, ValueRef)
             x, y = (a_ref, b_ref) if a_ref.id <= b_ref.id else (b_ref, a_ref)
-            return (inst.op, out.dtype, x.id, y.id)
+            return (inst.op, out.dtype, out.lanes, x.id, y.id)
         if inst.op in {"floordiv", "mod"}:
             a_ref, b_ref = (_remap_arg(inst.args[0]), _remap_arg(inst.args[1]))
             assert isinstance(a_ref, ValueRef) and isinstance(b_ref, ValueRef)
-            return (inst.op, out.dtype, a_ref.id, b_ref.id)
+            return (inst.op, out.dtype, out.lanes, a_ref.id, b_ref.id)
         if inst.op == "lt":
             a_ref, b_ref = (_remap_arg(inst.args[0]), _remap_arg(inst.args[1]))
             assert isinstance(a_ref, ValueRef) and isinstance(b_ref, ValueRef)
-            return ("lt", out.dtype, a_ref.id, b_ref.id)
+            return ("lt", out.dtype, out.lanes, a_ref.id, b_ref.id)
         if inst.op in {"and", "or"}:
             a_ref, b_ref = (_remap_arg(inst.args[0]), _remap_arg(inst.args[1]))
             assert isinstance(a_ref, ValueRef) and isinstance(b_ref, ValueRef)
             x, y = (a_ref, b_ref) if a_ref.id <= b_ref.id else (b_ref, a_ref)
-            return (inst.op, out.dtype, x.id, y.id)
+            return (inst.op, out.dtype, out.lanes, x.id, y.id)
         if inst.op == "not":
             x_ref = _remap_arg(inst.args[0])
             assert isinstance(x_ref, ValueRef)
-            return ("not", out.dtype, x_ref.id)
+            return ("not", out.dtype, out.lanes, x_ref.id)
         if inst.op == "where":
             c_ref, a_ref, b_ref = map(_remap_arg, inst.args)
             assert isinstance(c_ref, ValueRef)
             assert isinstance(a_ref, ValueRef)
             assert isinstance(b_ref, ValueRef)
-            return ("where", out.dtype, c_ref.id, a_ref.id, b_ref.id)
+            return ("where", out.dtype, out.lanes, c_ref.id, a_ref.id, b_ref.id)
         if inst.op == "cast":
             x_ref = _remap_arg(inst.args[0])
             dst = inst.args[1]
             assert isinstance(x_ref, ValueRef)
             assert isinstance(dst, DType)
-            return ("cast", out.dtype, x_ref.id, dst)
+            return ("cast", out.dtype, out.lanes, x_ref.id, dst)
         if inst.op == "fma":
             x_ref, y_ref, z_ref = map(_remap_arg, inst.args)
             assert isinstance(x_ref, ValueRef)
@@ -1085,7 +1156,7 @@ def _cse_pure(ir: IRModule) -> IRModule:
             assert isinstance(z_ref, ValueRef)
             # x and y are commutative (multiplication), z is addition
             x, y = (x_ref, y_ref) if x_ref.id <= y_ref.id else (y_ref, x_ref)
-            return ("fma", out.dtype, x.id, y.id, z_ref.id)
+            return ("fma", out.dtype, out.lanes, x.id, y.id, z_ref.id)
         return None
 
     for inst in ir.insts:
@@ -1166,8 +1237,8 @@ def _dce(ir: IRModule) -> IRModule:
             _mark(frag_ref)
         elif inst.op == "barrier":
             pass
-        elif inst.op == "arange":
-            # Keep arange even if its SSA result is unused: it defines threadgroup_size.
+        elif inst.op in {"arange", "tid"}:
+            # Keep arange/tid even if unused: they can define launch/block sizing.
             assert inst.out is not None
             live_ids.add(inst.out.id)
         elif inst.op == "arg":
@@ -1189,7 +1260,7 @@ def _dce(ir: IRModule) -> IRModule:
 
     new_insts: list[Inst] = []
     for inst in ir.insts:
-        if inst.op in {"arg", "store", "arange", "barrier"}:
+        if inst.op in {"arg", "store", "arange", "tid", "barrier"}:
             new_insts.append(inst)
             continue
         if inst.out is None:

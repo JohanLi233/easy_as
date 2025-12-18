@@ -54,7 +54,7 @@ def matmul_simdgroup_mma_kernel(
 
     pid_n = mk.program_id(0)
     pid_m = mk.program_id(1)
-    tid = mk.arange(0, NT)
+    tid = mk.tid(0, NT)
     sg = mk.sg_id()
 
     base_m = pid_m * BM

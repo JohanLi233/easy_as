@@ -16,7 +16,7 @@ from eas.ir import DType, IRModule, Inst, ValueRef
 @eas.kernel
 def _simple_add_kernel(a, b, c, N, BLOCK: eas.constexpr):
     pid = mk.program_id(0)
-    offs = pid * BLOCK + mk.arange(0, BLOCK)
+    offs = pid * BLOCK + mk.tid(0, BLOCK)
     mask = offs < N
     mk.store(c, offs, mk.load(a, offs, mask) + mk.load(b, offs, mask), mask)
 
@@ -57,8 +57,8 @@ class TestThreadIdRewrite(unittest.TestCase):
                 Inst("program_id", pid, (0,)),
                 Inst("const", block, (256,)),
                 Inst("mul", mul, (pid, block)),
-                Inst("arange", ar0, (0, 256)),
-                Inst("arange", ar1, (0, 128)),
+                Inst("tid", ar0, (0, 256)),
+                Inst("tid", ar1, (0, 128)),
                 Inst("add", out, (mul, ar0)),
             ),
         )
@@ -76,7 +76,7 @@ class TestThreadIdRewrite(unittest.TestCase):
                 Inst("program_id", pid, (0,)),
                 Inst("const", block, (256,)),
                 Inst("mul", mul, (pid, block)),
-                Inst("arange", ar0, (0, 256)),
+                Inst("tid", ar0, (0, 256)),
                 Inst("add", out, (mul, ar0)),
             ),
         )

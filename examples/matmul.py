@@ -31,7 +31,7 @@ def matmul_kernel(a, b, c, H, W, BLOCK: eas.constexpr, K: eas.constexpr):
     """
     tile = mk.program_id(0)
     row = mk.program_id(1)
-    col = tile * BLOCK + mk.arange(0, BLOCK)
+    col = tile * BLOCK + mk.tid(0, BLOCK)
     out = row * W + col
     mask = mk.where(row < H, col < W, False)
 

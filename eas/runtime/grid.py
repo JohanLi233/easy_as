@@ -58,7 +58,9 @@ def infer_grid(
       - 2D: grid = (ceil_div(W, BLOCK), H, 1)
       - 3D: grid = (ceil_div(W, BLOCK), H, D)
 
-    `BLOCK` is the inferred `threadgroup_size` (from `mk.arange(0, BLOCK)`).
+    `BLOCK` is the inferred block size:
+      - thread mode: from `mk.tid(0, BLOCK)`
+      - spmd mode: from `mk.arange(0, BLOCK)`
 
     Dimension sources (in priority order):
       1) explicit `shape` runtime option (uses last 2/3 dims)

@@ -35,7 +35,7 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="easy_as 元素级加法演示")
     parser.add_argument("--n", type=int, default=1024 + 7, help="元素数量")
     parser.add_argument(
-        "--block", type=int, default=256, help="BLOCK 大小（线程组大小）"
+        "--block", type=int, default=256, help="BLOCK 大小（program 内向量宽度）"
     )
     parser.add_argument("--iters", type=int, default=1, help="计时的迭代次数")
     parser.add_argument("--print-msl", action="store_true", help="打印生成的 MSL")

@@ -13,7 +13,7 @@ from eas import mk
 @eas.kernel
 def bool_simplify_kernel(out, N, BLOCK: eas.constexpr):
     pid = mk.program_id(0)
-    tid = pid * BLOCK + mk.arange(0, BLOCK)
+    tid = pid * BLOCK + mk.tid(0, BLOCK)
     c0 = tid < N
     c1 = tid < (N + 1)
     m = mk.where(c0, c1, False)
@@ -29,7 +29,7 @@ class TestBoolSimplify(unittest.TestCase):
 
 @eas.kernel
 def bool_chain_mask_kernel(out, N, BLOCK: eas.constexpr):
-    tid = mk.arange(0, BLOCK)
+    tid = mk.tid(0, BLOCK)
     c0 = tid < N
     c1 = tid < (N + 1)
     c2 = tid < (N + 2)

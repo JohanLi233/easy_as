@@ -105,6 +105,18 @@ def arange(start: int, size: int) -> val:
     return _b().arange(start, size)
 
 
+def tid(start: int, size: int) -> val:
+    """
+    Thread-level local id (old mk.arange semantics).
+
+    In the Triton-style SPMD model, mk.arange(...) returns a vector value within
+    one program instance. When you need per-hardware-thread indexing (e.g. for
+    threadgroup memory collaboration, simdgroup MMA, etc.), use mk.tid(...).
+    """
+
+    return _b().tid(start, size)
+
+
 def alloc_tg(size: int) -> val:
     return _b().alloc_tg(size)
 

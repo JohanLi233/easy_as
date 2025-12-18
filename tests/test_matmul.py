@@ -16,7 +16,7 @@ from eas.runtime import get_runtime
 def matmul_kernel(a, b, c, M, N, BLOCK: eas.constexpr, K: eas.constexpr):
     row = mk.program_id(0)
     tile = mk.program_id(1)
-    col = tile * BLOCK + mk.arange(0, BLOCK)
+    col = tile * BLOCK + mk.tid(0, BLOCK)
     out = row * N + col
     mask = mk.where(row < M, col < N, False)
 
